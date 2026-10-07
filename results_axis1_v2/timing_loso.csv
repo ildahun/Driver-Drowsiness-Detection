@@ -1,0 +1,7 @@
+method,ms_per_window
+chance_stratified,0.011712796051716922
+early_MLP,0.013222927564608031
+early_fusion_RF,0.47556180916695956
+early_paper_RF,0.24609697364595426
+early_paper_SVM,0.6208237500303719
+late_meta_reliability,1.1035922369429547
