@@ -162,14 +162,27 @@ def calib_mask(df, minutes):
     return (df.t_s < minutes * 60).to_numpy()
 
 
-def baseline_normalize(X, df, minutes):
-    """Ατομική κανονικοποίηση: αφαιρείται η μέση τιμή κάθε οδηγού στα πρώτα k λεπτά της οδήγησης σε εγρήγορση.
-    Δεν χρησιμοποιεί ετικέτες. Αν λείπει baseline, χρησιμοποιείται η μέση τιμή όλων των παραθύρων του οδηγού."""
+def baseline_normalize(X, df, minutes, mode="sessionA"):
+    """Ατομική κανονικοποίηση: αφαιρείται η μέση τιμή του οδηγού σε μια περίοδο αναφοράς. Δεν χρησιμοποιεί ετικέτες.
+    mode="sessionA": αναφορά = τα πρώτα k λεπτά της οδήγησης σε εγρήγορση (session A) του οδηγού,
+                     για ΟΛΕΣ τις οδηγήσεις του (χρειάζεται μία προηγούμενη οδήγηση βαθμονόμησης).
+    mode="same":     αναφορά = τα πρώτα k λεπτά της ΙΔΙΑΣ οδήγησης (καμία προηγούμενη οδήγηση· ο οδηγός
+                     μπορεί να είναι ήδη κουρασμένος στην αρχή της, όπως στην πράξη).
+    Αν λείπει αναφορά, χρησιμοποιείται η μέση τιμή όλων των παραθύρων του οδηγού."""
     Xn = X.copy()
-    for s in df.subject.unique():
-        rows = (df.subject == s).to_numpy()
-        base = rows & (df.session == "A").to_numpy() & (df.t_s < minutes * 60).to_numpy()
-        ref = X[base] if base.sum() >= 2 else X[rows]
+    early = (df.t_s < minutes * 60).to_numpy()
+    if mode == "same":
+        units = [((df.subject == s) & (df.session == ss)).to_numpy()
+                 for s, ss in df[["subject", "session"]].drop_duplicates().itertuples(index=False)]
+    else:
+        units = [(df.subject == s).to_numpy() for s in df.subject.unique()]
+    for rows in units:
+        if mode == "same":
+            base = rows & early
+        else:
+            base = rows & (df.session == "A").to_numpy() & early
+        subj_rows = (df.subject == df.subject[rows].iloc[0]).to_numpy()
+        ref = X[base] if base.sum() >= 2 else X[subj_rows]
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             mu = np.nanmean(ref, axis=0)
@@ -187,7 +200,7 @@ def prep(Xtr, Xte_list):
 
 
 # ----------------------------------------------------------------------------- πείραμα
-def run(df, minutes_list, Model, seeds):
+def run(df, minutes_list, Model, seeds, baseline="sessionA"):
     y = df.y.to_numpy(int)
     groups = df.subject.to_numpy()
     feats = {b: [c for c in df.columns if c.startswith(f"{b}__")] for b in BRANCHES}
@@ -198,7 +211,7 @@ def run(df, minutes_list, Model, seeds):
 
     for k_min in minutes_list:
         cal = calib_mask(df, k_min)
-        Xnorm = {b: baseline_normalize(Xraw[b], df, k_min) for b in BRANCHES}
+        Xnorm = {b: baseline_normalize(Xraw[b], df, k_min, baseline) for b in BRANCHES}
         for si, s in enumerate(subjects, 1):
             print(f"k = {k_min} λεπτά · LOSO {si}/{len(subjects)}: νέος οδηγός {s}")
             tr = groups != s
@@ -328,6 +341,9 @@ def main():
     ap.add_argument("--minutes", default="2,4,8", help="λεπτά βαθμονόμησης, π.χ. 2,4,8")
     ap.add_argument("--seeds", type=int, default=3, help="επαναλήψεις με διαφορετικό seed (μέσος όρος)")
     ap.add_argument("--backend", choices=["torch", "sklearn"], default="torch")
+    ap.add_argument("--baseline", choices=["sessionA", "same"], default="sessionA",
+                    help="αναφορά κανονικοποίησης: sessionA = πρώτα k λεπτά της οδήγησης σε εγρήγορση, "
+                         "same = πρώτα k λεπτά της ίδιας οδήγησης")
     a = ap.parse_args()
     if a.backend == "torch":
         try:
@@ -337,9 +353,9 @@ def main():
                              "(ή τρέξτε με --backend sklearn)")
     Model = TorchMLP if a.backend == "torch" else SklearnMLP
     df = load(a.features)
-    print(f"{len(df)} παράθυρα, {df.subject.nunique()} οδηγοί, backend = {a.backend}")
+    print(f"{len(df)} παράθυρα, {df.subject.nunique()} οδηγοί, backend = {a.backend}, baseline = {a.baseline}")
     mins = [int(x) for x in a.minutes.split(",")]
-    res = run(df, mins, Model, seeds=list(range(SEED, SEED + a.seeds)))
+    res = run(df, mins, Model, seeds=list(range(SEED, SEED + a.seeds)), baseline=a.baseline)
     summ, per, tests = summarize(res)
     Path(a.out).mkdir(exist_ok=True)
     summ.to_csv(f"{a.out}/axis3_summary.csv", index=False, encoding="utf-8-sig")
