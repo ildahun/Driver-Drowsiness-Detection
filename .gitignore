@@ -1,0 +1,23 @@
+# Δεδομένα UL-DD και ό,τι προκύπτει απευθείας από αυτά: ΔΕΝ ανεβαίνουν (άδεια χρήσης του dataset)
+CSV_Files/
+Extracted_Features/
+Codes/
+4HZ_Individual_Data/
+Labels.csv
+Info.xlsx
+features.csv
+*.zip
+*.parquet
+*predictions*.csv
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# Windows / VS Code
+Thumbs.db
+desktop.ini
+.vscode/
