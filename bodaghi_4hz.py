@@ -33,16 +33,19 @@ from sklearn.model_selection import StratifiedKFold, StratifiedGroupKFold, Leave
 from sklearn.metrics import accuracy_score, f1_score
 
 SEED = 42
+# τα αρχεία που βγάζει το bodaghi_prep_4hz.py
 FILES = {"bio": "final_biometric_4HZ.csv", "grip": "final_grip_4HZ.csv",
          "tel": "final_telemetry_4HZ.csv", "pose": "final_pose_4HZ.csv",
          "fl": "final_FL_4HZ.csv", "fau": "final_FAU_4HZ.csv"}
+# εδώ το Behavioral έχει και pose (σε αντίθεση με το bodaghi_exact.py)
 COMBOS = {"Bio+Behavioral": ["bio", "grip", "tel", "pose"],
           "Bio+Facial": ["bio", "fl", "fau"],
           "Bio+Behavioral+Facial": ["bio", "grip", "tel", "fl", "fau", "pose"]}
-META = ["session", "user", "label"]
+META = ["session", "user", "label"]   # στήλες που δεν είναι χαρακτηριστικά
 
 
 def find_data(path):
+    # αν το --data δείχνει ήδη στον σωστό φάκελο, οκ· αλλιώς ψάχνω προς τα μέσα
     if path and os.path.isfile(os.path.join(path, FILES["bio"])):
         return path
     start = path or "."
@@ -60,6 +63,7 @@ def load(folder):
         t = time.time()
         dfs[k] = pd.read_csv(os.path.join(folder, f), low_memory=False)
         print(f"  {f}: {len(dfs[k]):,} γραμμές, {dfs[k].shape[1]} στήλες ({time.time()-t:.0f} s)")
+    # αν δεν έχουν όλα ίδιο μήκος, οι γραμμές δεν ταιριάζουν 100% (το κρατάω όπως το κάνουν)
     n = {k: len(d) for k, d in dfs.items()}
     if len(set(n.values())) != 1:
         print(f"  Προσοχή: διαφορετικός αριθμός γραμμών {n} · η συνένωση γίνεται κατά θέση, όπως στο notebook τους")
@@ -71,21 +75,24 @@ def build(dfs, parts):
     X = pd.concat([dfs[p].drop(columns=[c for c in META if c in dfs[p].columns]).reset_index(drop=True)
                    for p in parts], axis=1)
     meta = dfs[parts[-1]][META].reset_index(drop=True).reindex(range(len(X)))
+    # αν το τελευταίο αρχείο είναι πιο κοντό, οι γραμμές που περισσεύουν δεν έχουν οδηγό -> έξω
     keep = meta["user"].notna().to_numpy()
     if not keep.all():
         print(f"  Προσοχή: {(~keep).sum():,} γραμμές χωρίς οδηγό (από τη συνένωση κατά θέση) αφαιρούνται")
         X, meta = X[keep].reset_index(drop=True), meta[keep].reset_index(drop=True)
     X = X.apply(pd.to_numeric, errors="coerce")
-    X = X.loc[:, X.notna().any()]
+    X = X.loc[:, X.notna().any()]          # πετάω στήλες που είναι όλες NaN
     nan = int(X.isna().sum().sum())
     if nan:
         X = X.fillna(X.median())
+    # KSS -> τάξη (0: <4, 1: 4-6, 2: >=7)
     y = meta["label"].apply(lambda x: 0 if x < 4 else 1 if x < 7 else 2).to_numpy()
     groups = meta["user"].astype(str).to_numpy()
-    return X.to_numpy(np.float32), y, groups, nan
+    return X.to_numpy(np.float32), y, groups, nan   # float32 για λιγότερη μνήμη
 
 
 def models():
+    # lambda = φτιάχνει καινούριο μοντέλο σε κάθε fold
     return {"SVM": lambda: SVC(kernel="rbf", C=0.1, gamma="auto", class_weight="balanced",
                                cache_size=1000, random_state=SEED),
             "RF": lambda: RandomForestClassifier(n_estimators=100, max_depth=5, min_samples_leaf=10,
@@ -96,6 +103,7 @@ def subsample(idx, y, k, rng):
     if k is None or len(idx) <= k:
         return idx
     # στρωματοποιημένο τυχαίο υποσύνολο
+    # (κάθε τάξη κρατά το ίδιο ποσοστό που έχει στο σύνολο)
     out = []
     for c in np.unique(y[idx]):
         ic = idx[y[idx] == c]
@@ -107,12 +115,13 @@ def evaluate(X, y, groups, splits, leak, name, svm_k, skip_svm, rng):
     """leak=True: scaler+PCA σε όλα τα δεδομένα (όπως το άρθρο)."""
     if leak:
         Z = PCA(n_components=0.90, random_state=SEED).fit_transform(MinMaxScaler().fit_transform(X))
-    pred = {m: np.full(len(y), -1) for m in models()}
+    pred = {m: np.full(len(y), -1) for m in models()}   # -1 = δεν έχει πρόβλεψη ακόμα
     for f, (tr, te) in enumerate(splits, 1):
         t = time.time()
         if leak:
             Ztr, Zte = Z[tr], Z[te]
         else:
+            # fit μόνο στο train, μετά transform και στα δύο
             sc = MinMaxScaler().fit(X[tr])
             pca = PCA(n_components=0.90, random_state=SEED).fit(sc.transform(X[tr]))
             Ztr, Zte = pca.transform(sc.transform(X[tr])), pca.transform(sc.transform(X[te]))
@@ -120,16 +129,17 @@ def evaluate(X, y, groups, splits, leak, name, svm_k, skip_svm, rng):
             if m == "SVM" and skip_svm:
                 continue
             sub = np.arange(len(tr))
-            if m == "SVM":
+            if m == "SVM":   # SVM μόνο σε υποσύνολο, αλλιώς αργεί πολύ
                 sub = subsample(np.arange(len(tr)), y[tr], svm_k, rng)
             pred[m][te] = make().fit(Ztr[sub], y[tr][sub]).predict(Zte)
         print(f"    {name} fold {f} ({time.time()-t:.0f} s)", flush=True)
     rows, per = [], []
     for m, p in pred.items():
-        if (p < 0).all():
+        if (p < 0).all():   # π.χ. SVM με --skip-svm
             continue
         rows.append({"model": m, "accuracy": 100 * accuracy_score(y, p),
                      "macro_F1": 100 * f1_score(y, p, average="macro")})
+        # και ανά οδηγό, μόνο με τις τάξεις που έχει ο καθένας
         for g in np.unique(groups):
             ig = groups == g
             per.append({"model": m, "driver": g, "accuracy": 100 * accuracy_score(y[ig], p[ig]),
@@ -145,7 +155,7 @@ def main():
     ap.add_argument("--protocols", default="A,B,C")
     ap.add_argument("--combos", default=",".join(COMBOS))
     ap.add_argument("--svm-max-train", type=int, default=20000)
-    ap.add_argument("--skip-svm", action="store_true")
+    ap.add_argument("--skip-svm", action="store_true")   # μόνο RF, για γρήγορο τρέξιμο
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     rng = np.random.default_rng(SEED)
@@ -156,6 +166,7 @@ def main():
     f_res = os.path.join(a.out, "bodaghi_4hz_results.csv")
     f_per = os.path.join(a.out, "bodaghi_4hz_per_driver.csv")
     # συνέχεια από εκεί που σταμάτησε: ό,τι έχει ήδη αποθηκευτεί δεν ξανατρέχει
+    # (για να βγουν όλα από την αρχή, σβήνω τα δύο csv)
     allrows = pd.read_csv(f_res).to_dict("records") if os.path.isfile(f_res) else []
     allper = pd.read_csv(f_per).to_dict("records") if os.path.isfile(f_per) else []
     done = {(r["combo"], r["protocol"]) for r in allrows}
@@ -173,13 +184,15 @@ def main():
               + (f", {nan} κενές τιμές → διάμεσος" if nan else ""))
         for P in todo:
             label = labels[P]
-            if P == "A":
+            # επιλογή διαχωρισμού ανάλογα με το πρωτόκολλο
+            if P == "A":     # τυχαία δείγματα, με διαρροή
                 sp, leak = StratifiedKFold(5, shuffle=True, random_state=SEED).split(X, y), True
-            elif P == "B":
+            elif P == "B":   # 5 ομάδες οδηγών
                 sp, leak = StratifiedGroupKFold(5, shuffle=True, random_state=SEED).split(X, y, groups), False
-            else:
+            else:            # ένας οδηγός κάθε φορά
                 sp, leak = LeaveOneGroupOut().split(X, y, groups), False
             print(f"  πρωτόκολλο {label}")
+            # διαφορετικό seed ανά combo/πρωτόκολλο, αλλά πάντα το ίδιο σε κάθε τρέξιμο
             rng = np.random.default_rng(SEED + 10 * ci + "ABC".index(P))
             rows, per = evaluate(X, y, groups, list(sp), leak, P, a.svm_max_train, a.skip_svm, rng)
             for r in rows:
@@ -198,9 +211,11 @@ def main():
     pd.set_option("display.width", 200)
     print("\n=== Κώδικας Bodaghi στα 4 Hz · accuracy και macro F1 (%) ===")
     print("A = όπως το άρθρο (τυχαία δείγματα) · B = 5-fold ανά οδηγό · C = LOSO")
+    # πίνακας: γραμμές combo/μοντέλο, στήλες πρωτόκολλα
     t = res.pivot_table(index=["combo", "model"], columns="protocol", values=["accuracy", "macro_F1"])
     print(t.round(1).to_string())
     if "C_LOSO" in set(res["protocol"]):
+        # πόσο διαφέρει από οδηγό σε οδηγό
         d = per[per["protocol"] == "C_LOSO"].groupby(["combo", "model"])["macro_F1"]
         print("\n=== LOSO ανά οδηγό · macro F1 (%) ===")
         print(pd.DataFrame({"μέσος": d.mean(), "ελάχ.": d.min(), "μέγ.": d.max()}).round(1).to_string())
