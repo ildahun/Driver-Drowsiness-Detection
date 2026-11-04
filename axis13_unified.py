@@ -57,6 +57,7 @@ WORK = {  # μέθοδος -> σχετική εργασία
 
 def mask(P_list, flags, Q, b):
     """Ο κλάδος b «χάνεται» στον έλεγχο."""
+    # όπως το mask_branch του ul_dd_baseline, αλλά μηδενίζει και την ποιότητα Q
     P2 = [p.copy() for p in P_list]
     f2, Q2 = flags.copy(), Q.copy()
     P2[b][:] = np.nan
@@ -69,6 +70,7 @@ def run(df, k_min, baseline, trees):
     y = df.y.to_numpy(int)
     groups = df.subject.to_numpy()
     feat = {b: [c for c in df.columns if c.startswith(f"{b}__")] for b in BR}
+    # δύο εκδοχές των ίδιων χαρακτηριστικών: όπως είναι και εξατομικευμένα
     Xraw = {b: df[feat[b]].to_numpy(float) for b in BR}
     Xnorm = {b: a3.baseline_normalize(Xraw[b], df, k_min, baseline) for b in BR}
     avail = {b: ~np.isnan(Xraw[b]).all(axis=1) for b in BR}
@@ -83,9 +85,11 @@ def run(df, k_min, baseline, trees):
     for si, s in enumerate(subjects, 1):
         tr = np.where(groups != s)[0]
         te = np.where((groups == s) & ~cal)[0]          # έλεγχος ΜΟΝΟ μετά τη βαθμονόμηση
+        # (και το raw αξιολογείται στα ίδια παράθυρα, ώστε η σύγκριση raw / norm να είναι δίκαιη)
         if len(te) == 0:
             continue
         t0 = time.time()
+        # όλη η διαδικασία δύο φορές: μία με raw και μία με norm χαρακτηριστικά
         for space, X in (("raw", Xraw), ("norm", Xnorm)):
             # --- κλάδοι (Random Forest): OOF στο train, μοντέλο στο train
             Ptr, Pte = [], []
@@ -122,6 +126,7 @@ def run(df, k_min, baseline, trees):
                                   ("pca", PCA(0.90, random_state=ul.SEED)),
                                   ("svm", SVC(kernel="rbf", C=0.1, gamma="auto", class_weight="balanced"))]
                                  ).fit(Xall[tr], y[tr])
+            # RF με τις ακριβείς παραμέτρους του άρθρου (100 δέντρα, βάθος 5)
             early_prf = Pipeline([("imp", SimpleImputer(strategy="median")), ("mm", MinMaxScaler()),
                                   ("pca", PCA(0.90, random_state=ul.SEED)),
                                   ("rf", RandomForestClassifier(n_estimators=100, max_depth=5, min_samples_leaf=10,
@@ -129,7 +134,7 @@ def run(df, k_min, baseline, trees):
             early_mlp = Pipeline([("imp", SimpleImputer(strategy="median")), ("sc", StandardScaler()),
                                   ("mlp", MLPClassifier((64, 32), alpha=1e-3, max_iter=300, early_stopping=True,
                                                         random_state=ul.SEED))]).fit(Xall[tr], y[tr])
-            cols = np.cumsum([0] + [X[b].shape[1] for b in BR])
+            cols = np.cumsum([0] + [X[b].shape[1] for b in BR])     # όρια στηλών κάθε κλάδου στο Xall
             # Kontras et al.: κάθε τροπικότητα μόνη της (μόνο στο σενάριο all, στα διαθέσιμα παράθυρα)
             for bi, b in enumerate(BR):
                 ok = ~np.isnan(Pte[bi][:, 0])
@@ -141,6 +146,7 @@ def run(df, k_min, baseline, trees):
                     P_, f_, Q_ = Pte, fte, Qte
                     Xe = Xall[te]
                 else:
+                    # late: κρύβω τις πιθανότητες, early: κρύβω τις στήλες του κλάδου
                     bi = BR.index(scen[3:])
                     P_, f_, Q_ = mask(Pte, fte, Qte, bi)
                     Xe = Xall[te].copy()
@@ -173,11 +179,12 @@ def metrics(g):
         "macro_F1": f1_score(yt, yp, average="macro", labels=[0, 1, 2], zero_division=0),
         "recall_High": recall_score(yt, yp, labels=[2], average="macro", zero_division=0),
         "kappa_quadratic": cohen_kappa_score(yt, yp, weights="quadratic"),
-        "false_alarm_rate": float((yp[alert] == 2).mean()) if alert.any() else np.nan,
+        "false_alarm_rate": float((yp[alert] == 2).mean()) if alert.any() else np.nan,   # Alert -> High
     })
 
 
 def per_subject(res):
+    # macro F1 για κάθε (raw/norm, μέθοδο, σενάριο, οδηγό)
     return (res.groupby(["space", "method", "scenario", "subject"])
             .apply(lambda g: f1_score(g.y_true, g.y_pred, average="macro", labels=[0, 1, 2], zero_division=0))
             .rename("F1").reset_index())
@@ -185,6 +192,7 @@ def per_subject(res):
 
 def compare(ps, a, b, scen="all"):
     """Wilcoxon ανά οδηγό: a=(space, method) έναντι b=(space, method)."""
+    # π.χ. a = ("norm", PROPOSED), b = ("raw", "late_meta_dropout")
     s = ps[ps.scenario == scen].pivot_table(index="subject", columns=["space", "method"], values="F1")
     d = (s[a] - s[b]).dropna()
     try:
@@ -223,6 +231,7 @@ def main():
           .round(3).to_string(index=False))
 
     # η προτεινόμενη με εξατομίκευση έναντι: (α) του εαυτού της χωρίς, (β) κάθε άλλης μεθόδου με και χωρίς
+    # (α) δείχνει πόσο βοηθά η εξατομίκευση, (β) αν κερδίζει και όταν οι άλλες έχουν κι αυτές εξατομίκευση
     rows = [compare(ps, ("norm", PROPOSED), ("raw", PROPOSED))]
     for m in WORK:
         if m == PROPOSED:
@@ -237,6 +246,7 @@ def main():
     print(st.round(4).to_string(index=False))
 
     print("\n=== Άξονας 2 μετά την εξατομίκευση: λείπει ένας αισθητήρας (macro F1) ===")
+    # τα unimodal βγαίνουν, γιατί δεν έχουν σενάρια no_*
     t = summ[~summ.method.str.startswith("unimodal")].pivot_table(index=["space", "method"], columns="scenario",
                                                                     values="macro_F1")
     t["F1_missing_mean"] = t[[f"no_{b}" for b in BR]].mean(1)
