@@ -15,7 +15,7 @@ bodaghi_prep_4hz.py — Η προεπεξεργασία των Bodaghi et al. (U
   - Τα κενά frames του βίντεο γεμίζουν με NaN, μετά γραμμική παρεμβολή ανά οδηγό/οδήγηση
   - Συνένωση των αρχείων κάθε τροπικότητας «κατά στήλες» με τη σειρά των γραμμών
 
-Διαβάζει κατευθείαν από τα zip (δεν χρειάζεται να αποσυμπιέσεις το Extracted_Features.zip
+Διαβάζει κατευθείαν από τα zip (δεν χρειάζεται  αποσυμπιέσει το Extracted_Features.zip
 των 4,5 GB) ή από αποσυμπιεσμένους φακέλους.
 
 Χρήση:
@@ -30,6 +30,7 @@ warnings.filterwarnings("ignore")
 import numpy as np
 import pandas as pd
 
+# A_HR_D.csv -> Drowsy, A_HR_A.csv -> Alert
 SESS = lambda fn: "Drowsy" if os.path.splitext(fn)[0].split("_")[-1].startswith("D") else "Alert"
 
 
@@ -42,6 +43,7 @@ class Source:
             self.names = sorted(n for n in self.zf.namelist() if n.lower().endswith(".csv"))
         elif os.path.isdir(path):
             self.zf = None
+            # όλα τα csv και στους υποφακέλους
             self.names = sorted(os.path.relpath(os.path.join(r, f), path)
                                 for r, _, fs in os.walk(path) for f in fs if f.lower().endswith(".csv"))
         else:
@@ -53,11 +55,11 @@ class Source:
         for n in self.names:
             fn = os.path.basename(n)
             if f"_{tag}_D" in fn or f"_{tag}_A" in fn:
-                out.append((n, fn.split("_")[0], SESS(fn)))
+                out.append((n, fn.split("_")[0], SESS(fn)))   # (αρχείο, οδηγός, session)
         return out
 
     def read(self, name, **kw):
-        if self.zf:
+        if self.zf:   # από zip χωρίς αποσυμπίεση
             with self.zf.open(name) as f:
                 return pd.read_csv(io.BytesIO(f.read()), **kw)
         return pd.read_csv(os.path.join(self.path, name), **kw)
@@ -70,21 +72,24 @@ def log(msg):
 # ---------------------------------------------------------------- notebook 1
 def change_frequency(df, current_hz, target_hz):
     def resample_group(group):
-        if target_hz < current_hz:
+        if target_hz < current_hz:     # downsample: κρατάω 1 γραμμή κάθε k
             return group.iloc[::int(current_hz / target_hz), :].reset_index(drop=True)
-        elif target_hz > current_hz:
+        elif target_hz > current_hz:   # upsample: κάθε γραμμή επαναλαμβάνεται k φορές
             return group.loc[group.index.repeat(int(target_hz / current_hz))].reset_index(drop=True)
         return group
+    # χωριστά για κάθε οδηγό/session
     parts = [resample_group(g) for _, g in df.groupby(["user", "session"], sort=True)]
     return pd.concat(parts, ignore_index=True)
 
 
 def combine(src, tag, names=None, **kw):
+    # ενώνει όλους τους οδηγούς για ένα σήμα σε ένα df
     files = src.find(tag)
     if not files:
         sys.exit(f"Δεν βρέθηκαν αρχεία {tag} στο {src.path}")
     dfs = []
     for n, user, sess in files:
+        # names -> αρχεία χωρίς header
         d = src.read(n, header=None, names=names) if names else src.read(n, low_memory=False)
         d["user"], d["session"] = user, sess
         dfs.append(d)
@@ -94,6 +99,7 @@ def combine(src, tag, names=None, **kw):
 
 def grip_3to4(df):
     # όπως στο notebook: ομάδες των 3 γραμμών στο ενιαίο ευρετήριο + επανάληψη της τελευταίας
+    # (δεν χωρίζει ανά οδηγό, το κρατάω όπως το έχουν)
     n = len(df); idx = []
     for s in range(0, n, 3):
         e = min(s + 3, n)
@@ -108,16 +114,17 @@ def video(src, tag, frame_col):
         sys.exit(f"Δεν βρέθηκαν αρχεία {tag} στο {src.path}")
     groups = {}
     for n, user, sess in files:
-        groups.setdefault((user, sess), []).append(n)
+        groups.setdefault((user, sess), []).append(n)   # ένα session μπορεί να είναι σε πολλά αρχεία
     out = []
     for (user, sess) in sorted(groups):
         g = pd.concat([src.read(n, low_memory=False) for n in groups[(user, sess)]], ignore_index=True)
         g["user"], g["session"] = user, sess
         g = g.drop_duplicates(subset=frame_col, keep="first")
+        # πλήρης σειρά frames, όσα λείπουν μένουν NaN
         fr = np.arange(g[frame_col].min(), g[frame_col].max() + 1)
         g = pd.merge(pd.DataFrame({frame_col: fr}), g, on=frame_col, how="left")[:len(fr)]
         g["user"], g["session"] = user, sess
-        out.append(g.iloc[::15, :].reset_index(drop=True))
+        out.append(g.iloc[::15, :].reset_index(drop=True))   # 60/15 = 4 Hz
     log(f"  {tag}: {len(files)} αρχεία")
     return pd.concat(out, ignore_index=True)
 
@@ -125,6 +132,8 @@ def video(src, tag, frame_col):
 # ---------------------------------------------------------------- notebooks 2_x
 def concat_modality(frames):
     """frames: λίστα DataFrame με τη σειρά os.listdir (αλφαβητική) του φακέλου τους"""
+    # κολλάει τα σήματα δίπλα-δίπλα (axis=1), user/session μία φορά στο τέλος
+    # ΠΡΟΣΟΧΗ: θεωρεί ότι οι γραμμές είναι ευθυγραμμισμένες, δεν κάνει merge
     user_session = None; parts = []
     for df in frames:
         if "user" in df.columns and "session" in df.columns:
@@ -138,7 +147,7 @@ def concat_modality(frames):
 def label(combined, labels):
     labels = labels.copy()
     labels.columns = ["user_session"] + [f"minute_{i}" for i in range(1, 11)]
-    spi = 4 * 4 * 60
+    spi = 4 * 4 * 60   # δείγματα ανά 4λεπτο στα 4 Hz = 960
     expanded = []
     for (user, session), group in combined.groupby(["user", "session"]):
         key = f"{user}_{session}"
@@ -146,7 +155,8 @@ def label(combined, labels):
             row = labels[labels["user_session"] == key].iloc[0, 1:]
             lst = []
             for lb in row:
-                lst.extend([lb] * spi)
+                lst.extend([lb] * spi)   # κάθε KSS απλώνεται σε 960 γραμμές
+            # κόψιμο ή συμπλήρωση με NaN ώστε να ταιριάζει το μήκος
             lst = lst[:len(group)]
             if len(lst) < len(group):
                 lst.extend([np.nan] * (len(group) - len(lst)))
@@ -159,6 +169,7 @@ def label(combined, labels):
 
 # ---------------------------------------------------------------- notebooks 3_x (μόνο αποθήκευση)
 def interp_groups(df, cols):
+    # γραμμική παρεμβολή NaN, χωριστά ανά οδηγό/session
     df[cols] = df.groupby(["user", "session"])[cols].apply(
         lambda g: g.interpolate(method="linear", axis=0, limit_direction="forward")
     ).reset_index(drop=True, level=["user", "session"])
@@ -167,6 +178,7 @@ def interp_groups(df, cols):
 
 def final_biometric(lab, out):
     df = lab.copy()
+    # μόνο SPO2 και pulse_rate παρεμβάλλονται (όπως στο 3_1)
     df[["SPO2", "pulse_rate"]] = df[["SPO2", "pulse_rate"]].apply(pd.to_numeric, errors="coerce")
     df[["SPO2", "pulse_rate"]] = df.groupby(["user", "session"])[["SPO2", "pulse_rate"]].apply(
         lambda g: g.interpolate(method="linear", limit_direction="forward")
@@ -181,14 +193,16 @@ def final_behavioral(lab, out):
     df_tel = lab[tc + ["user", "session", "label"]].copy()
     mask = (df_tel["user"] == "A") & (df_tel["session"] == "Alert")
     if mask.any():
+        # γεμίζω το A_Alert με τηλεμετρία άλλου οδηγού που έχει το ίδιο label
+        # (έτσι το κάνουν, είναι αμφίβολο αλλά το κρατάω για αναπαραγωγή)
         target = df_tel.loc[mask, "label"].iloc[0]
         sim = df_tel[(df_tel["label"] == target) & ~(df_tel["user"] == "A") & ~df_tel[tc].isna().any(axis=1)]
         groups = sim.groupby(["user", "session"])
         n = mask.sum()
         keys = list(groups.groups.keys())
         if keys:
-            sel = groups.get_group(keys[0])
-            if len(sel) < n:
+            sel = groups.get_group(keys[0])   # παίρνει το πρώτο
+            if len(sel) < n:                   # αν δεν φτάνει, επανάληψη
                 sel = pd.concat([sel] * int(np.ceil(n / len(sel))), ignore_index=True)
             df_tel.loc[mask, tc] = sel[tc].iloc[:n].reset_index(drop=True).values
             log(f"  A_Alert telemetry: μεταφορά από {keys[0][0]}_{keys[0][1]} (όπως στο 3_2)")
@@ -206,10 +220,12 @@ def final_behavioral(lab, out):
 
 
 def final_facial(lab, out):
+    # landmarks = στήλες με X / Y στο όνομα
     cols = [c for c in lab.columns if "X" in c or "Y" in c] + ["user", "session", "label"]
     df_fl = lab[cols].copy()
     df_fl = interp_groups(df_fl, df_fl.select_dtypes(include=["number"]).columns)
     df_fl.to_csv(os.path.join(out, "final_FL_4HZ.csv"), index=False)
+    # FAU = ό,τι μένει αφού βγάλω landmarks και frame
     drop = [c for c in lab.columns if "X" in c or "Y" in c] + ["Frame", "Frame_Number"]
     df_fau = lab.drop(columns=[c for c in drop if c in lab.columns]).copy()
     df_fau.replace([np.inf, -np.inf], np.nan, inplace=True)
@@ -220,6 +236,7 @@ def final_facial(lab, out):
 
 # ---------------------------------------------------------------- main
 def find_labels(given, roots):
+    # πρώτα το --labels, μετά Labels.csv στους γνωστούς φακέλους, μετά ψάξιμο παντού
     cands = [given] if given else []
     for r in roots:
         cands += [os.path.join(r, "Labels.csv")]
@@ -256,17 +273,17 @@ def main():
         log("Βιομετρικά (notebook 1 → 2_1 → 3_1)")
         acc = change_frequency(combine(csv, "ACC", ["X", "Y", "Z"]), 32, 4)
         bvp = change_frequency(combine(csv, "BVP", ["BVP"]), 64, 4)
-        eda = combine(csv, "EDA", ["EDA"])
+        eda = combine(csv, "EDA", ["EDA"])                      # ήδη 4 Hz
         hr = change_frequency(combine(csv, "HR", ["HR"]), 1, 4)
         o2m = combine(csv, "O2M", ["SPO2", "pulse_rate", "motion"])
         for c in ["SPO2", "pulse_rate", "motion"]:
             o2m[c] = pd.to_numeric(o2m[c], errors="coerce")
         o2m.replace([np.inf, -np.inf], np.nan, inplace=True)
         o2m = change_frequency(o2m, 0.5, 4)
-        temp = combine(csv, "TEMP", ["TEMP"])
+        temp = combine(csv, "TEMP", ["TEMP"])                   # ήδη 4 Hz
         # αλφαβητική σειρά αρχείων στον φάκελο Biometrics_4HZ: ACC, BVP, EDA, HR, O2M, TEMP
         lab = label(concat_modality([acc, bvp, eda, hr, o2m, temp]), labels)
-        del acc, bvp, eda, hr, o2m, temp
+        del acc, bvp, eda, hr, o2m, temp   # μνήμη
         n = final_biometric(lab, a.out); del lab
         log(f"  → final_biometric_4HZ.csv ({n:,} γραμμές)")
 
@@ -280,10 +297,11 @@ def main():
         lgp = grip_3to4(combine(csv, "LGP", ["LGP"]))
         rgp = grip_3to4(combine(csv, "RGP", ["RGP"]))
         tel = combine(csv, "Telemetry")
+        # A_Alert δεν έχει telemetry -> 40 λεπτά * 60 Hz = 144000 κενές γραμμές στην αρχή
         nan = pd.DataFrame({"user": ["A"] * 144000, "session": ["Alert"] * 144000,
                             **{c: [np.nan] * 144000 for c in tel.columns if c not in ["user", "session"]}})
         tel = change_frequency(pd.concat([nan, tel], axis=0, ignore_index=True), 60, 4)
-        pl = video(feats, "PL", "frame")
+        pl = video(feats, "PL", "frame")   # pose landmarks
         # αλφαβητική σειρά στον φάκελο Behavioral_4HZ: LGP, PL, RGP, Telemetry
         lab = label(concat_modality([lgp, pl, rgp, tel]), labels)
         del lgp, rgp, tel, pl
