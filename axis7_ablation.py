@@ -37,6 +37,7 @@ import pandas as pd
 from scipy.stats import wilcoxon
 from sklearn.metrics import f1_score
 
+# όλα τα κομμάτια έρχονται από τα προηγούμενα axis
 import ul_dd_baseline as ul
 import axis3_personalization as a3
 from axis4_temporal import segments, temporal_block, apply_mask
@@ -45,54 +46,66 @@ from axis6_reliability import (robust_stats, anomaly, agreement, locf_ext, mask_
                                soft_vote_proba, corrupt, oof_multi)
 
 warnings.filterwarnings("ignore")
-BR, NC = ul.BRANCHES, ul.N_CLASSES
+BR, NC = ul.BRANCHES, ul.N_CLASSES   # ["bio","veh","face"], 3 τάξεις
 NB = len(BR)
 FULL = "FULL"
 ABL = ["-ψηφοφορία", "-meta", "-ανωμαλία", "-συμφωνία", "-χρόνος", "-ρεαλιστικές", "-εξατομίκευση"]
-REFS = ["Krishna_ίδια_εκπ", "Das"]
-ORDER_M = [FULL] + ABL + REFS
+REFS = ["Krishna_ίδια_εκπ", "Das"]   # μέθοδοι άλλων εργασιών
+ORDER_M = [FULL] + ABL + REFS        # σειρά γραμμών στους πίνακες
+# σενάρια ελέγχου στον νέο οδηγό:
+#   all = τίποτα, random60 = 60% τυχαία κενά, outage40 = μεγάλα κενά,
+#   noise16/noise40_blind = θόρυβος, spike40 = απότομες τιμές, frozen40 = κολλημένος αισθητήρας
 SCEN = ["all", "random60", "outage40", "noise16", "noise40_blind", "spike40", "frozen40"]
 ORDER_SC = SCEN + ["real_bad"]
-BAD_Q = 0.9
+BAD_Q = 0.9   # κάτω από αυτή την ποιότητα το παράθυρο μετράει ως "πραγματικά κακό"
 
 
 # ----------------------------------------------------------------------------- ένα fold
 def build(Xd, avail, sdd, y, groups, tr, sub, n, trees, rng, df, seg, order, Qall):
     """Κλάδοι (OOF + μοντέλο για τον νέο οδηγό), δείκτες ανωμαλίας, και αντίγραφα εκπαίδευσης."""
     trm = np.zeros(n, bool); trm[tr] = True
+    # δύο μάσκες για θόρυβο στο train: μικρά μπλοκ (16) και πολύ μεγάλα (1000)
     fb = [block_mask(df, seg, order, 16, rng), block_mask(df, seg, order, 1000, rng)]
-    stats = {b: robust_stats(Xd[b][tr]) for b in BR}
-    Pfull = [np.full((n, NC), np.nan) for _ in BR]
-    Pnoisy = [[np.full((n, NC), np.nan) for _ in BR] for _ in fb]
-    A = np.zeros((n, NB, 2)); An = [np.zeros((n, NB, 2)) for _ in fb]
+    stats = {b: robust_stats(Xd[b][tr]) for b in BR}   # στατιστικά μόνο από το train, για τον δείκτη ανωμαλίας
+    Pfull = [np.full((n, NC), np.nan) for _ in BR]     # πιθανότητες κλάδων, καθαρά δεδομένα
+    Pnoisy = [[np.full((n, NC), np.nan) for _ in BR] for _ in fb]   # ίδιο αλλά με θόρυβο
+    A = np.zeros((n, NB, 2)); An = [np.zeros((n, NB, 2)) for _ in fb]   # ανωμαλία: 2 τιμές ανά κλάδο
     models = {}
     for bi, b in enumerate(BR):
+        # θορυβώδεις εκδοχές του κλάδου (μόνο σε train γραμμές που είναι στη μάσκα)
         Xn = [corrupt(Xd[b], trm & m[:, bi] & avail[b], "train_noise", sdd[b], rng, seg, order) for m in fb]
+        # OOF προβλέψεις για καθαρό + θορυβώδη μαζί
         outs = oof_multi([Xd[b][tr]] + [x[tr] for x in Xn], y[tr], groups[tr], avail[b][tr], trees)
         Pfull[bi][tr] = outs[0]
         for k in range(len(fb)):
             Pnoisy[k][bi][tr] = outs[k + 1]
             An[k][:, bi] = anomaly(Xn[k], *stats[b])
         A[:, bi] = anomaly(Xd[b], *stats[b])
+        # τελικό μοντέλο κλάδου -> προβλέψεις για τον νέο οδηγό (sub)
         ok, okt = avail[b][sub], avail[b][tr]
         if okt.sum() >= 10 and ok.any():
             models[b] = ul.branch_model(trees).fit(Xd[b][tr][okt], y[tr][okt])
             Pfull[bi][sub[ok]] = ul.full_proba(models[b], Xd[b][sub][ok])
-    flags = np.stack([~np.isnan(P[:, 0]) for P in Pfull], 1).astype(int)
+    flags = np.stack([~np.isnan(P[:, 0]) for P in Pfull], 1).astype(int)   # 1 = κλάδος διαθέσιμος
     Q = Qall * flags
     A = A * flags[:, :, None]
-    z = np.zeros((n, NB))
+    z = np.zeros((n, NB))   # "ηλικία" τελευταίας τιμής LOCF = 0 (δεν έχει γίνει συμπλήρωση)
+    # --- αντίγραφα εκπαίδευσης με ρεαλιστικές βλάβες
     real = [(Pfull, flags, Q, A, z)]                                     # ρεαλιστικές βλάβες (όπως axis5/6)
+    # 30% τυχαία κενά + κενά σε μπλοκ 4 / 16 / 1000, μετά LOCF (κρατάω την τελευταία καλή τιμή)
     for d in [rng.random((n, NB)) < 0.3] + [block_mask(df, seg, order, m, rng) for m in (4, 16, 1000)]:
         P_, f_, Q_ = apply_mask(Pfull, flags, Q, d)
         real.append(locf_ext(P_, f_, Q_, mask_A(A, d), seg, order, 2.0))
+    # + ένα αντίγραφο με υποβαθμισμένη ποιότητα (όχι κενό, απλά χειρότερο σήμα)
     bm = block_mask(df, seg, order, 16, rng)
     P2, Q2 = degrade(Pfull, Q, {b: bm[:, b] for b in range(NB)}, rng)
     real.append((P2, flags, Q2, A, z))
+    # αντίγραφα με θόρυβο στα χαρακτηριστικά (όπου δεν υπάρχει θορυβώδης τιμή κρατάω την καθαρή)
     noisec = []
     for k in range(len(fb)):
         Pk = [np.where(np.isnan(Pnoisy[k][b]), Pfull[b], Pnoisy[k][b]) for b in range(NB)]
         noisec.append((Pk, flags, Q, An[k] * flags[:, :, None], z))
+    # για το ablation "-ρεαλιστικές": μόνο απλό dropout όπως στο ul_dd_baseline
     base = [(Pfull, flags, Q, A, z)]                                     # μόνο τυχαία κενά (dropout 20%)
     for _ in range(2):
         d = rng.random((n, NB)) < 0.2
@@ -103,20 +116,24 @@ def build(Xd, avail, sdd, y, groups, tr, sub, n, trees, rng, df, seg, order, Qal
 
 
 def feats(P, f, q, Aa, age, rows, seg, order, anom=True, agree=True, temp=True):
+    # είσοδος meta-classifier: αξιοπιστία + ηλικία LOCF (+ ανωμαλία + συμφωνία + χρόνος)
+    # τα anom/agree/temp = False είναι τα ablations
     Pr = [p[rows] for p in P]
     parts = [ul.reliability_features(Pr, f[rows], q[rows]), age[rows]]
     if anom:
-        parts.append(Aa[rows].reshape(len(rows), -1))
+        parts.append(Aa[rows].reshape(len(rows), -1))   # (n, 3, 2) -> (n, 6)
     if agree:
         parts.append(agreement(Pr, f[rows]))
     if temp:
-        parts.append(temporal_block(P, seg, order, 2)[rows])
+        parts.append(temporal_block(P, seg, order, 2)[rows])   # προβλέψεις προηγούμενων παραθύρων
     return np.hstack(parts)
 
 
 def fit_metas(B, y, tr, seg, order, which):
+    # εκπαιδεύει έναν meta-classifier για κάθε εκδοχή που ζητάω
     copies = B["real"] + B["noisec"]
     yc = np.concatenate([y[tr]] * len(copies))
+    # εκδοχή -> (ποια αντίγραφα εκπαίδευσης, ποια κομμάτια βγαίνουν)
     cfg = {FULL: (copies, dict()), "-ανωμαλία": (copies, dict(anom=False)),
            "-συμφωνία": (copies, dict(agree=False)), "-χρόνος": (copies, dict(temp=False)),
            "-ρεαλιστικές": (B["base"] + B["noisec"], dict())}
@@ -125,6 +142,8 @@ def fit_metas(B, y, tr, seg, order, which):
         cp, kw = cfg[name]
         yy = np.concatenate([y[tr]] * len(cp))
         out[name] = (ul.fit_meta(np.vstack([feats(*c, tr, seg, order, **kw) for c in cp]), yy), kw)
+    # Krishna: απλός meta (πιθανότητες + δείκτες) αλλά με τα ΙΔΙΑ αντίγραφα εκπαίδευσης με το FULL
+    # (το "or True" σημαίνει ότι τρέχει πάντα)
     if "krishna" in which or True:
         out["krishna"] = ul.fit_meta(np.vstack([ul.meta_features([p[tr] for p in c[0]], c[1][tr]) for c in copies]), yc)
     return out
@@ -136,12 +155,15 @@ def test_state(B, Xd, sdd, avail, sub, n, sc, M, trng, seg, order, noise, noise_
     Q_t, A_t = B["Q"].copy(), B["A"].copy()
     drop = np.zeros((n, NB), bool)
     subm = np.zeros(n, bool); subm[sub] = True
+    # τι βλάβη είναι: θόρυβος / spike / drift / frozen -> αλλοιώνω τα χαρακτηριστικά
+    #                 αλλιώς (random60, outage40) -> κενά
     kind = ("noise" if sc.startswith("noise") else sc.rstrip("0123456789")
             if sc[:5] in ("spike", "drift", "froze") else None)
     if kind:
         for bi, b in enumerate(BR):
             rows = subm & M[:, bi] & avail[b]
             if rows.any() and b in B["models"]:
+                # αλλοιωμένα χαρακτηριστικά -> ξανά πρόβλεψη από το μοντέλο του κλάδου
                 Xc = corrupt(Xd[b], rows, kind, sdd[b], trng, seg, order, noise[b], noise_sd)
                 P_t[bi][rows] = ul.full_proba(B["models"][b], Xc[rows])
                 A_t[rows, bi] = anomaly(Xc[rows], *B["stats"][b])
@@ -149,40 +171,45 @@ def test_state(B, Xd, sdd, avail, sub, n, sc, M, trng, seg, order, noise, noise_
         drop[sub] = M[sub]
     P_, f_, Q_ = apply_mask(P_t, B["flags"], Q_t, drop)
     PL, fL, QL, AL, aL = locf_ext(P_, f_, Q_, mask_A(A_t, drop), seg, order, 2.0)
+    # P_ = πριν το LOCF (για τον Das), το δεύτερο = μετά το LOCF (για τις υπόλοιπες)
     return P_, (PL, fL, QL, AL, aL)
 
 
 def run_seed(df, X, Xraw, avail, Qall, seed, trees, with_raw, noise_sd):
+    # όλο το LOSO για έναν σπόρο
     ul.SEED = seed
     y = df.y.to_numpy(int)
     groups = df.subject.to_numpy()
     seg, order = segments(df)
     n = len(df)
-    sd = {b: np.nanstd(X[b], axis=0) for b in BR}
+    sd = {b: np.nanstd(X[b], axis=0) for b in BR}       # τυπ. απόκλιση ανά στήλη, για το μέγεθος του θορύβου
     sdr = {b: np.nanstd(Xraw[b], axis=0) for b in BR}
-    cal = a3.calib_mask(df, 4)
+    cal = a3.calib_mask(df, 4)   # πρώτα 4 λεπτά αναφοράς -> όχι στο test
     rng = np.random.default_rng(seed)
-    srng = np.random.default_rng(seed + 7)
+    srng = np.random.default_rng(seed + 7)   # ξεχωριστός σπόρος για τα σενάρια ελέγχου
+    # μάσκες σεναρίων: φτιάχνονται μία φορά, ίδιες για όλες τις μεθόδους
     masks = {"all": np.zeros((n, NB), bool), "random60": srng.random((n, NB)) < 0.6}
     for sc in SCEN:
         if sc not in masks:
             masks[sc] = block_mask(df, seg, order, 16 if sc == "noise16" else 1000, srng)
     noise = {b: srng.normal(0, 1, X[b].shape) for b in BR}
     noise_r = {b: srng.normal(0, 1, Xraw[b].shape) for b in BR}
+    # πραγματικά κακά παράθυρα: λείπει κλάδος ή ποιότητα < 0.9
     bad = (np.stack([~avail[b] for b in BR], 1).any(1)) | (Qall < BAD_Q).any(1)
     rec = []
     for si, s in enumerate(sorted(np.unique(groups)), 1):
         t0 = time.time()
         tr = np.where(groups != s)[0]
-        sub = np.where(groups == s)[0]
-        te = np.where((groups == s) & ~cal)[0]
+        sub = np.where(groups == s)[0]               # όλα τα παράθυρα του νέου οδηγού
+        te = np.where((groups == s) & ~cal)[0]       # αυτά που αξιολογούνται
         if len(te) == 0:
             continue
+        # θέση κάθε παραθύρου του te μέσα στο sub
         pos = {i: j for j, i in enumerate(sub)}
         ite = np.array([pos[i] for i in te])
         B = build(X, avail, sd, y, groups, tr, sub, n, trees, rng, df, seg, order, Qall)
         mt = fit_metas(B, y, tr, seg, order, [FULL, "-ανωμαλία", "-συμφωνία", "-χρόνος", "-ρεαλιστικές"])
-        if with_raw:
+        if with_raw:   # ίδιο αλλά χωρίς κανονικοποίηση (για το -εξατομίκευση)
             Br = build(Xraw, avail, sdr, y, groups, tr, sub, n, trees, rng, df, seg, order, Qall)
             mr = fit_metas(Br, y, tr, seg, order, [FULL])
         for sc in SCEN:
@@ -190,9 +217,10 @@ def run_seed(df, X, Xraw, avail, Qall, seed, trees, with_raw, noise_sd):
             P_, st = test_state(B, X, sd, avail, sub, n, sc, masks[sc], trng, seg, order, noise, noise_sd)
             PL, fL, QL, AL, aL = st
             mp = lambda name: mt[name][0].predict_proba(feats(PL, fL, QL, AL, aL, sub, seg, order, **mt[name][1]))
-            pv = rel_vote_proba([p[sub] for p in PL], AL[sub], fL[sub])
-            psv = soft_vote_proba([p[sub] for p in PL])
+            pv = rel_vote_proba([p[sub] for p in PL], AL[sub], fL[sub])   # ψηφοφορία αξιοπιστίας
+            psv = soft_vote_proba([p[sub] for p in PL])                    # απλή ψηφοφορία
             pf = mp(FULL)
+            # FULL = μισό meta + μισό ψηφοφορία αξιοπιστίας, τα άλλα αλλάζουν ένα κομμάτι
             preds = {
                 FULL: 0.5 * pf + 0.5 * pv,
                 "-ψηφοφορία": pf,
@@ -202,14 +230,16 @@ def run_seed(df, X, Xraw, avail, Qall, seed, trees, with_raw, noise_sd):
                 "-χρόνος": 0.5 * mp("-χρόνος") + 0.5 * pv,
                 "-ρεαλιστικές": 0.5 * mp("-ρεαλιστικές") + 0.5 * pv,
                 "Krishna_ίδια_εκπ": mt["krishna"].predict_proba(ul.meta_features([p[sub] for p in PL], fL[sub])),
-                "Das": soft_vote_proba([p[sub] for p in P_]),
+                "Das": soft_vote_proba([p[sub] for p in P_]),   # χωρίς LOCF
             }
             if with_raw:
+                # ίδιος σπόρος -> ίδιο σενάριο βλάβης με την κανονικοποιημένη εκδοχή
                 trng = np.random.default_rng(seed + 1000 + SCEN.index(sc))
                 _, str_ = test_state(Br, Xraw, sdr, avail, sub, n, sc, masks[sc], trng, seg, order, noise_r, noise_sd)
                 PLr, fLr, QLr, ALr, aLr = str_
                 preds["-εξατομίκευση"] = (0.5 * mr[FULL][0].predict_proba(feats(PLr, fLr, QLr, ALr, aLr, sub, seg, order))
                                           + 0.5 * rel_vote_proba([p[sub] for p in PLr], ALr[sub], fLr[sub]))
+            # καταγραφή μόνο για τα παράθυρα te
             for mth, pr in preds.items():
                 lab = pr.argmax(1)[ite]
                 for i, p in zip(te, lab):
@@ -221,6 +251,7 @@ def run_seed(df, X, Xraw, avail, Qall, seed, trees, with_raw, noise_sd):
 
 # ----------------------------------------------------------------------------- στατιστικά
 def holm(p):
+    # ίδια με το axis9
     p = np.asarray(p, float)
     out = np.full_like(p, np.nan)
     ok = ~np.isnan(p)
@@ -232,6 +263,7 @@ def holm(p):
 
 
 def f1m(g):
+    # macro F1 μιας ομάδας γραμμών (για groupby.apply)
     return f1_score(g.y_true, g.y_pred, average="macro", labels=[0, 1, 2], zero_division=0)
 
 
@@ -242,30 +274,31 @@ def main():
     ap.add_argument("--seeds", type=int, default=5)
     ap.add_argument("--raw-seeds", type=int, default=1, help="σε πόσους σπόρους τρέχει και το -εξατομίκευση")
     ap.add_argument("--trees", type=int, default=150)
-    ap.add_argument("--noise", type=float, default=1.5)
+    ap.add_argument("--noise", type=float, default=1.5)   # ένταση θορύβου στα σενάρια ελέγχου
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     df = a3.load(a.features)
     feat = {b: [c for c in df.columns if c.startswith(f"{b}__")] for b in BR}
-    X = {b: a3.baseline_normalize(df[feat[b]].to_numpy(float), df, 4, "sessionA") for b in BR}
-    Xraw = {b: df[feat[b]].to_numpy(float) for b in BR}
+    X = {b: a3.baseline_normalize(df[feat[b]].to_numpy(float), df, 4, "sessionA") for b in BR}   # κανονικοποιημένα
+    Xraw = {b: df[feat[b]].to_numpy(float) for b in BR}                                          # χωρίς κανονικοποίηση
     avail = {b: ~np.isnan(df[feat[b]].to_numpy(float)).all(axis=1) for b in BR}
     qcols = [f"q__{b}" for b in BR]
     Qall = (df[qcols].fillna(0.0).to_numpy(float) if all(c in df for c in qcols)
             else np.stack([avail[b] for b in BR], 1).astype(float))
-    seeds = [42 + k for k in range(a.seeds)]
+    seeds = [42 + k for k in range(a.seeds)]   # 42, 43, 44, 45, 46
     print(f"{len(df)} παράθυρα, {df.subject.nunique()} οδηγοί · ablation · σπόροι {seeds} · "
           f"-εξατομίκευση στους πρώτους {a.raw_seeds}")
     parts = []
     for k, sd in enumerate(seeds):
         f = f"{a.out}/ablation_predictions_seed{sd}.csv"
-        if os.path.exists(f):
+        if os.path.exists(f):   # ήδη έτοιμος από προηγούμενο τρέξιμο
             print(f"σπόρος {sd}: υπάρχει ήδη, τον φορτώνω"); parts.append(pd.read_csv(f)); continue
         t0 = time.time()
         r = run_seed(df, X, Xraw, avail, Qall, sd, a.trees, k < a.raw_seeds, a.noise)
         r.to_csv(f, index=False); parts.append(r)
         print(f"σπόρος {sd}: έτοιμος ({(time.time() - t0) / 60:.1f} λεπτά) · αποθηκεύτηκε", flush=True)
     res = pd.concat(parts)
+    # real_bad = οι προβλέψεις του "all" μόνο στα πραγματικά κακά παράθυρα
     rb = res[(res.scenario == "all") & res.bad].copy(); rb["scenario"] = "real_bad"
     res = pd.concat([res, rb])
     pd.set_option("display.width", 260)
@@ -279,6 +312,7 @@ def main():
     agg = per_seed.groupby(["method", "scenario"]).F1.agg(["mean", "std"]).reset_index()
     agg.to_csv(f"{a.out}/ablation_summary.csv", index=False, encoding="utf-8-sig")
     meth = [m for m in ORDER_M if m in agg.method.unique()]
+    # κελί "0.512±0.008"
     cell = agg.assign(c=agg["mean"].map("{:.3f}".format) + "±" + agg["std"].fillna(0).map("{:.3f}".format))
     t1 = cell.pivot_table(index="method", columns="scenario", values="c", aggfunc="first").loc[meth, ORDER_SC]
     print(f"\n=== Ablation · macro F1 · μέσος όρος {len(seeds)} σπόρων ± SD ===")
@@ -294,6 +328,7 @@ def main():
     print(delta.drop(index=FULL).to_string())
 
     # 3. Wilcoxon στο F1 ανά οδηγό (μέσος όρος σπόρων) + Holm
+    # πρώτα F1 ανά οδηγό σε κάθε σπόρο, μετά μέσος όρος των σπόρων -> μία τιμή ανά οδηγό
     ps = (res.groupby(["seed", "method", "scenario", "subject"]).apply(f1m).rename("F1").reset_index()
           .groupby(["method", "scenario", "subject"]).F1.mean().reset_index())
     ps.to_csv(f"{a.out}/ablation_per_subject.csv", index=False)
@@ -303,7 +338,7 @@ def main():
         for m in meth:
             if m == FULL or m not in t:
                 continue
-            d = (t[FULL] - t[m]).dropna()
+            d = (t[FULL] - t[m]).dropna()   # θετικό = κερδίζει η FULL
             try:
                 p = wilcoxon(d).pvalue if (d != 0).any() and len(d) >= 5 else np.nan
             except ValueError:
@@ -316,6 +351,7 @@ def main():
         st.loc[m_, "p_holm"] = holm(st.loc[m_, "p"].to_numpy())
     st["sig"] = st.p_holm < 0.05
     st.to_csv(f"{a.out}/ablation_stats.csv", index=False, encoding="utf-8-sig")
+    # κελί "15/4 H=0.012*"
     st["c"] = st.apply(lambda r: f"{r.wins}/{r.losses} H={r.p_holm:.3f}{'*' if r.sig else ''}", axis=1)
     t3 = st.pivot_table(index="scenario", columns="method", values="c", aggfunc="first")
     t3 = t3.loc[[s for s in ORDER_SC if s in t3.index]]
@@ -325,6 +361,7 @@ def main():
     print(t3[[m for m in ABL if m in t3.columns]].to_string())
 
     # 4. σταθερότητα μεταξύ σπόρων
+    # σε κάθε σενάριο: σε πόσους από τους σπόρους η FULL > Krishna
     w = per_seed.pivot_table(index=["seed", "scenario"], columns="method", values="F1")
     cons = ((w[FULL] > w["Krishna_ίδια_εκπ"]).groupby("scenario").sum().astype(int).astype(str)
             + f"/{len(seeds)}").reindex(ORDER_SC)
