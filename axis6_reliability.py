@@ -53,9 +53,9 @@ from axis5_realistic import block_mask, degrade
 warnings.filterwarnings("ignore")
 BR, NC = ul.BRANCHES, ul.N_CLASSES
 NB = len(BR)
-WIN_MIN = 0.5
+WIN_MIN = 0.5      # ένα παράθυρο = 30 s = 0,5 λεπτό (για την ηλικία του LOCF)
 NEW = "late_meta_anomaly"
-NEWS = [NEW, "late_reliability_vote", "late_meta_anomaly_blend"]
+NEWS = [NEW, "late_reliability_vote", "late_meta_anomaly_blend"]   # οι νέες μέθοδοι
 REFS = ["late_meta_dropout_robust", "late_meta_dropout_realistic", "late_soft_voting", "late_meta_realistic_temporal"]
 WORK = {NEW: "ΝΕΟ: δείκτες ανωμαλίας + συμφωνίας", "late_reliability_vote": "ΝΕΟ: ψηφοφορία με βάρη αξιοπιστίας",
         "late_meta_anomaly_blend": "ΝΕΟ: meta + ψηφοφορία αξιοπιστίας",
@@ -68,10 +68,13 @@ ORDER_SC = ["all", "random60", "outage40", "noise16", "noise40", "noise40_blind"
 
 # ----------------------------------------------------------------------------- δείκτες αξιοπιστίας
 def robust_stats(Xtr):
+    # "φυσιολογικές" τιμές από το train: διάμεσος και κλίμακα από το IQR
+    # IQR / 1.349 = ίδιο με την τυπ. απόκλιση αν τα δεδομένα είναι κανονικά, αλλά δεν επηρεάζεται από ακραίες τιμές
     med = np.nanmedian(Xtr, axis=0)
     q1, q3 = np.nanpercentile(Xtr, 25, axis=0), np.nanpercentile(Xtr, 75, axis=0)
     scale = (q3 - q1) / 1.349
     sd = np.nanstd(Xtr, axis=0)
+    # αν το IQR είναι 0 (π.χ. στήλη σχεδόν σταθερή) -> std, αν και αυτό 0 -> 1, για να μη διαιρώ με 0
     scale = np.where(scale > 1e-9, scale, np.where(sd > 1e-9, sd, 1.0))
     return np.nan_to_num(med), scale
 
@@ -80,23 +83,25 @@ def anomaly(Xb, med, scale):
     """(n, 2): ποσοστό χαρακτηριστικών με |z| > 3 και μέσο |z| / 10 (με όριο 10). 0 όπου λείπει ο κλάδος."""
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        z = np.abs((Xb - med) / scale)
-        frac = np.nanmean(z > 3, axis=1)
+        z = np.abs((Xb - med) / scale)                    # πόσο μακριά από το φυσιολογικό, σε "SD"
+        frac = np.nanmean(z > 3, axis=1)                  # τι ποσοστό των στηλών είναι ακραίο
         frac = np.where(np.isnan(Xb).all(1), np.nan, frac)
-        mz = np.nanmean(np.minimum(z, 10.0), axis=1) / 10.0
-    return np.nan_to_num(np.stack([frac, mz], 1), nan=0.0)
+        mz = np.nanmean(np.minimum(z, 10.0), axis=1) / 10.0   # κόβω στο 10 για να μη "σκάει" από μια τεράστια τιμή
+    return np.nan_to_num(np.stack([frac, mz], 1), nan=0.0)   # και τα δύο στο 0..1
 
 
 def agreement(P_list, flags):
     """(n, 3): 1 − ½·L1 ανάμεσα στον κλάδο και τον μέσο όρο των άλλων διαθέσιμων · 0,5 αν δεν υπάρχει σύγκριση."""
+    # 1 = ίδια πρόβλεψη με τους άλλους, 0 = εντελώς αντίθετη
+    # (½·L1 ανάμεσα σε δύο κατανομές πιθανοτήτων είναι πάντα από 0 έως 1)
     n = len(flags)
     out = np.full((n, NB), 0.5)
     S = np.stack([np.nan_to_num(P, nan=0.0) for P in P_list])           # (3, n, C)
     F = flags.astype(float)
     for b in range(NB):
         others = [o for o in range(NB) if o != b]
-        cnt = F[:, others].sum(1)
-        m = sum(S[o] * F[:, [o]] for o in others) / np.maximum(cnt, 1)[:, None]
+        cnt = F[:, others].sum(1)                                       # πόσοι άλλοι κλάδοι υπάρχουν
+        m = sum(S[o] * F[:, [o]] for o in others) / np.maximum(cnt, 1)[:, None]   # μέσος όρος των άλλων
         ok = (F[:, b] == 1) & (cnt > 0)
         out[ok, b] = 1 - 0.5 * np.abs(S[b][ok] - m[ok]).sum(1)
     return out
@@ -104,48 +109,56 @@ def agreement(P_list, flags):
 
 def locf_ext(P_list, flags, Q, A, seg, order, max_age):
     """Όπως το locf_with_age του axis5, αλλά μεταφέρει και τους δείκτες ανωμαλίας A (n, 3, 2)."""
+    # LOCF = last observation carried forward: αν ο κλάδος λείπει, κρατάω την τελευταία καλή πρόβλεψη,
+    # αλλά μόνο για max_age λεπτά. age = πόσο παλιά είναι (0..1), ώστε ο meta να ξέρει ότι είναι "μπαγιάτικη"
     P2 = [p.copy() for p in P_list]
     f2, Q2, A2 = flags.copy(), Q.copy(), A.copy()
     age = np.zeros((len(flags), NB))
     for b in range(NB):
         last, lastA, last_seg, cnt = None, None, None, 0
-        for i in order:
-            if last_seg != seg[i]:
+        for i in order:                                  # με χρονική σειρά
+            if last_seg != seg[i]:                       # νέα οδήγηση -> μηδενίζω (δεν μεταφέρω από άλλη οδήγηση)
                 last, lastA, last_seg, cnt = None, None, seg[i], 0
-            if f2[i, b]:
+            if f2[i, b]:                                 # υπάρχει -> το κρατάω ως τελευταίο
                 last, lastA, cnt = P2[b][i].copy(), A2[i, b].copy(), 0
                 continue
             cnt += 1
-            a = cnt * WIN_MIN
+            a = cnt * WIN_MIN                            # λεπτά από την τελευταία καλή τιμή
             if last is not None and a <= max_age:
                 P2[b][i], A2[i, b] = last, lastA
                 f2[i, b] = 1
                 age[i, b] = a / max_age
             else:
-                age[i, b] = 1.0
+                age[i, b] = 1.0                          # πολύ παλιό ή δεν υπάρχει -> μένει κενό
+    # το Q δεν συμπληρώνεται (μένει χαμηλό), ώστε να φαίνεται ότι δεν είναι φρέσκια μέτρηση
     return P2, f2, Q2, A2, age
 
 
 def mask_A(A, drop):
+    # όπου ο κλάδος "χάνεται", μηδενίζω και την ανωμαλία του
     A2 = A.copy()
     A2[drop] = 0.0
     return A2
 
 
 def rel_weights(A, flags):
+    # βάρος κλάδου = (1 − ποσοστό ακραίων)², 0 αν λείπει
+    # το τετράγωνο τιμωρεί πιο έντονα τους κλάδους με πολλές ακραίες τιμές
     return flags * (1 - np.clip(A[:, :, 0], 0, 1)) ** 2
 
 
 def rel_vote_proba(P_list, A, flags):
+    # σταθμισμένος μέσος όρος πιθανοτήτων με τα βάρη αξιοπιστίας (δεν εκπαιδεύεται)
     w = rel_weights(A, flags)
     S = sum(np.nan_to_num(P, nan=0.0) * w[:, [b]] for b, P in enumerate(P_list))
     tot = w.sum(1)
     S = S / np.maximum(tot, 1e-9)[:, None]
-    S[tot <= 1e-9] = 1.0 / NC
+    S[tot <= 1e-9] = 1.0 / NC                            # κανένας κλάδος -> ίσες πιθανότητες
     return S
 
 
 def soft_vote_proba(P_list):
+    # Das et al.: απλός μέσος όρος (όπως soft_vote του ul_dd_baseline, αλλά επιστρέφει πιθανότητες)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         avg = np.nanmean(np.stack(P_list), axis=0)
@@ -160,27 +173,32 @@ def corrupt(Xb, rows, kind, sd, rng, seg, order, noise=None, noise_sd=1.5):
     if not rows.any():
         return Xc
     if kind == "noise":
+        # θόρυβος σταθερής έντασης (noise_sd × SD), ο θόρυβος έρχεται έτοιμος απ' έξω ώστε να είναι ίδιος για όλες τις μεθόδους
         Xc[rows] = Xb[rows] + noise_sd * sd * noise[rows]
     elif kind == "train_noise":                       # μόνο για την εκπαίδευση: ένταση 0,5–2,5 SD
-        k = rng.uniform(0.5, 2.5, rows.sum())[:, None]
+        k = rng.uniform(0.5, 2.5, rows.sum())[:, None]   # διαφορετική ένταση σε κάθε γραμμή
         Xc[rows] = Xb[rows] + k * sd * rng.normal(0, 1, (rows.sum(), Xb.shape[1]))
     elif kind == "spike":
+        # στο 20% των τιμών προσθέτω ±5 SD
         hit = rng.random((rows.sum(), Xb.shape[1])) < 0.2
         sign = np.where(rng.random(hit.shape) < 0.5, -1.0, 1.0)
         Xc[rows] = Xb[rows] + hit * sign * 5.0 * sd
     elif kind in ("drift", "frozen"):
+        # αυτά θέλουν χρονική σειρά, οπότε ανά οδήγηση (seg)
         for sg in np.unique(seg[rows]):
             idx = order[(seg[order] == sg) & rows[order]]          # οι γραμμές της βλάβης, με χρονική σειρά
             if kind == "drift":
-                ramp = np.linspace(0, 1, len(idx))[:, None]
+                ramp = np.linspace(0, 1, len(idx))[:, None]        # από 0 σε 1 σιγά-σιγά
                 Xc[idx] = Xb[idx] + 3.0 * sd * ramp
             else:
-                Xc[idx] = Xb[idx[0]]
+                Xc[idx] = Xb[idx[0]]                               # όλες = η πρώτη τιμή
     return Xc
 
 
 def oof_multi(Xs, y, groups, avail, trees):
     """OOF προβλέψεις κλάδου για το καθαρό Xs[0] ΚΑΙ για αλλοιωμένες εκδοχές Xs[1:], με τα ίδια μοντέλα των folds."""
+    # το μοντέλο εκπαιδεύεται ΜΟΝΟ στα καθαρά δεδομένα, μετά προβλέπει και στα θορυβώδη
+    # (έτσι ο meta βλέπει πώς συμπεριφέρεται ένα κανονικό μοντέλο όταν του δίνεις χαλασμένο σήμα)
     out = [np.full((len(y), NC), np.nan) for _ in Xs]
     splits = GroupKFold(n_splits=min(5, len(np.unique(groups)))).split(Xs[0], y, groups)
     for tr, va in splits:
@@ -197,10 +215,10 @@ def oof_multi(Xs, y, groups, avail, trees):
 def run(df, k_min, baseline, trees, max_age, noise_sd):
     y = df.y.to_numpy(int)
     groups = df.subject.to_numpy()
-    seg, order = segments(df)
+    seg, order = segments(df)                  # seg = σε ποια οδήγηση ανήκει κάθε παράθυρο, order = χρονική σειρά
     n = len(df)
     feat = {b: [c for c in df.columns if c.startswith(f"{b}__")] for b in BR}
-    X = {b: a3.baseline_normalize(df[feat[b]].to_numpy(float), df, k_min, baseline) for b in BR}
+    X = {b: a3.baseline_normalize(df[feat[b]].to_numpy(float), df, k_min, baseline) for b in BR}   # εξατομίκευση
     avail = {b: ~np.isnan(df[feat[b]].to_numpy(float)).all(axis=1) for b in BR}
     sd = {b: np.nanstd(X[b], axis=0) for b in BR}
     qcols = [f"q__{b}" for b in BR]
@@ -209,6 +227,7 @@ def run(df, k_min, baseline, trees, max_age, noise_sd):
     cal = a3.calib_mask(df, k_min)
     rng = np.random.default_rng(ul.SEED)
     # σενάρια: ίδια σειρά κλήσεων με το axis5 → ίδιες μάσκες και ίδιος θόρυβος στα κοινά σενάρια
+    # (γι' αυτό φτιάχνονται και random30 / outage4 / outage16 ενώ δεν χρησιμοποιούνται εδώ)
     srng = np.random.default_rng(ul.SEED + 7)
     s5 = {"all": np.zeros((n, NB), bool)}
     for p in (30, 60):
@@ -218,9 +237,10 @@ def run(df, k_min, baseline, trees, max_age, noise_sd):
     for m in (16, 40):
         s5[f"noise{m}"] = block_mask(df, seg, order, m if m < 40 else 1000, srng)
     noise = {b: srng.normal(0, 1, X[b].shape) for b in BR}
+    # τα νέα σενάρια με δικό τους σπόρο, ώστε να μην αλλάζουν τα παλιά
     xrng = np.random.default_rng(ul.SEED + 11)
     scen = {k: s5[k] for k in ("all", "random60", "outage40", "noise16", "noise40")}
-    scen["noise40_blind"] = s5["noise40"]
+    scen["noise40_blind"] = s5["noise40"]      # ίδια μάσκα με το noise40, η διαφορά είναι μόνο στο Q
     for kind in ("spike", "drift", "frozen"):
         scen[f"{kind}40"] = block_mask(df, seg, order, 1000, xrng)
     test_rng = {k: np.random.default_rng(ul.SEED + 100 + i) for i, k in enumerate(scen)}
@@ -235,6 +255,7 @@ def run(df, k_min, baseline, trees, max_age, noise_sd):
             continue
         trm = np.zeros(n, bool); trm[tr] = True
         # --- βλάβες σήματος για την εκπαίδευση (μόνο στους οδηγούς εκπαίδευσης)
+        # (ίδιο κομμάτι που έγινε αργότερα η build() του axis7)
         fb = [block_mask(df, seg, order, 16, rng), block_mask(df, seg, order, 1000, rng)]
         stats = {b: robust_stats(X[b][tr]) for b in BR}
         Pfull = [np.full((n, NC), np.nan) for _ in BR]
@@ -268,21 +289,24 @@ def run(df, k_min, baseline, trees, max_age, noise_sd):
         bm = block_mask(df, seg, order, 16, rng)
         P2, Q2 = degrade(Pfull, Q, {b: bm[:, b] for b in range(NB)}, rng)
         copies.append((P2, flags, Q2, A, np.zeros((n, NB))))
+        # τα 2 τελευταία αντίγραφα = θόρυβος χαρακτηριστικών (αυτό είναι το καινούριο σε σχέση με το axis5)
         for k in range(len(fb)):
             Pk = [np.where(np.isnan(Pnoisy[k][b]), Pfull[b], Pnoisy[k][b]) for b in range(NB)]
             copies.append((Pk, flags, Q, An[k] * flags[:, :, None], np.zeros((n, NB))))
         yc = np.concatenate([y[tr]] * len(copies))
 
         def feats_new(P, f, q, Aa, age, rows):
+            # αξιοπιστία + ηλικία LOCF + ανωμαλία + συμφωνία + χρόνος (= το feats του axis7 με όλα True)
             Pr = [p[rows] for p in P]
             return np.hstack([ul.reliability_features(Pr, f[rows], q[rows]), age[rows],
                               Aa[rows].reshape(len(rows), -1), agreement(Pr, f[rows]),
                               temporal_block(P, seg, order, 2)[rows]])
 
         meta_new = ul.fit_meta(np.vstack([feats_new(*c, tr) for c in copies]), yc)
+        # Krishna με τα ίδια αντίγραφα (δίκαιη σύγκριση)
         meta_kr = ul.fit_meta(np.vstack([ul.meta_features([p[tr] for p in c[0]], c[1][tr]) for c in copies]), yc)
         # τα δύο μοντέλα αναφοράς του axis5 (χωρίς θόρυβο χαρακτηριστικών στην εκπαίδευση)
-        real = copies[:-len(fb)]
+        real = copies[:-len(fb)]                              # όλα εκτός από τα 2 θορυβώδη
         yr = np.concatenate([y[tr]] * len(real))
         meta_rt = ul.fit_meta(np.vstack([np.hstack([ul.reliability_features([p[tr] for p in c[0]], c[1][tr], c[2][tr]),
                                                     c[4][tr], temporal_block(c[0], seg, order, 2)[tr]])
@@ -308,6 +332,7 @@ def run(df, k_min, baseline, trees, max_age, noise_sd):
                         A_t[rows, bi] = anomaly(Xc[rows], *stats[b])
                         if sc in ("noise16", "noise40"):
                             Q_t[rows, bi] = 0.3                     # όπως στο axis5
+                            # (στο noise40_blind ΔΕΝ πέφτει -> εκεί φαίνεται αν βοηθάει η ανωμαλία)
             else:
                 drop[sub] = M[sub]
             P_, f_, Q_ = apply_mask(P_t, flags, Q_t, drop)
@@ -317,13 +342,13 @@ def run(df, k_min, baseline, trees, max_age, noise_sd):
             preds = {
                 NEW: pm.argmax(1)[ite],
                 "late_reliability_vote": pv.argmax(1)[ite],
-                "late_meta_anomaly_blend": (0.5 * pm + 0.5 * pv).argmax(1)[ite],
+                "late_meta_anomaly_blend": (0.5 * pm + 0.5 * pv).argmax(1)[ite],   # αυτό έγινε το FULL στο axis7
                 "late_meta_realistic_temporal": meta_rt.predict(np.hstack([
                     ul.reliability_features([p[sub] for p in PL], fL[sub], QL[sub]), aL[sub],
                     temporal_block(PL, seg, order, 2)[sub]]))[ite],
                 "late_meta_dropout_realistic": meta_dr.predict(ul.meta_features([p[sub] for p in PL], fL[sub]))[ite],
                 "late_meta_dropout_robust": meta_kr.predict(ul.meta_features([p[sub] for p in PL], fL[sub]))[ite],
-                "late_soft_voting": soft_vote_proba([p[te] for p in P_]).argmax(1),
+                "late_soft_voting": soft_vote_proba([p[te] for p in P_]).argmax(1),   # Das: χωρίς LOCF
             }
             for mth, pr in preds.items():
                 for i, p in zip(te, pr):
@@ -336,10 +361,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--features", default="features.csv")
     ap.add_argument("--out", default="results_reliability")
-    ap.add_argument("--minutes", type=int, default=4)
+    ap.add_argument("--minutes", type=int, default=4)       # λεπτά αναφοράς για την εξατομίκευση
     ap.add_argument("--baseline", choices=["sessionA", "same"], default="sessionA")
     ap.add_argument("--trees", type=int, default=150)
-    ap.add_argument("--max-age", type=float, default=2.0)
+    ap.add_argument("--max-age", type=float, default=2.0)   # μέχρι πόσα λεπτά κρατάω παλιά τιμή στο LOCF
     ap.add_argument("--noise", type=float, default=1.5)
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
@@ -349,6 +374,7 @@ def main():
     res.to_csv(f"{a.out}/reliability_predictions.csv", index=False)
 
     def met(g):
+        # false_alarm = από τα πραγματικά Alert, πόσα βγήκαν High (λάθος συναγερμός)
         yt, yp = g.y_true.to_numpy(), g.y_pred.to_numpy()
         return pd.Series({"macro_F1": f1_score(yt, yp, average="macro", labels=[0, 1, 2], zero_division=0),
                           "kappa": cohen_kappa_score(yt, yp, weights="quadratic"),
@@ -363,6 +389,7 @@ def main():
     print(piv.round(3).to_string())
     print("\n" + "\n".join(f"  {m:30s} {WORK[m]}" for m in piv.index))
 
+    # F1 ανά οδηγό για τον Wilcoxon
     ps = (res.groupby(["method", "scenario", "subject"])
           .apply(lambda g: f1_score(g.y_true, g.y_pred, average="macro", labels=[0, 1, 2], zero_division=0))
           .rename("F1").reset_index())
@@ -370,6 +397,7 @@ def main():
     rows = []
     for sc in ORDER_SC:
         t = ps[ps.scenario == sc].pivot_table(index="subject", columns="method", values="F1")
+        # κάθε νέα μέθοδος έναντι κάθε αναφοράς (εδώ χωρίς Holm, η διόρθωση μπήκε στο axis7)
         for mn in NEWS:
             for m in REFS:
                 d = (t[mn] - t[m]).dropna()
@@ -379,7 +407,7 @@ def main():
                     p = np.nan
                 rows.append({"scenario": sc, "new": mn, "baseline": m, "F1_new": t[mn].mean(),
                              "F1_baseline": t[m].mean(), "wins": int((d > 0).sum()), "losses": int((d < 0).sum()),
-                             "wilcoxon_p": p, "significant": bool(p < 0.05) if p == p else False})
+                             "wilcoxon_p": p, "significant": bool(p < 0.05) if p == p else False})   # p == p -> όχι NaN
     st = pd.DataFrame(rows)
     st.to_csv(f"{a.out}/reliability_stats.csv", index=False, encoding="utf-8-sig")
     short = {"late_meta_dropout_robust": "Krishna_ίδια_εκπ", "late_meta_dropout_realistic": "Krishna_ρεαλ",
