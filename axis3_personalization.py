@@ -42,6 +42,8 @@ INTERVAL_S = 240
 # ----------------------------------------------------------------------------- μοντέλα
 class TorchMLP:
     """Νευρωνικό δίκτυο ενός κλάδου: encoder (2 κρυφά επίπεδα) + head (γραμμικό επίπεδο εξόδου)."""
+    # encoder: είσοδος -> 64 -> 32 (ReLU + dropout), head: 32 -> 3 τάξεις
+    # χωριστά, ώστε στο fine-tuning να "παγώνει" ο encoder και να αλλάζει μόνο το head
 
     def __init__(self, n_in, seed=SEED, hidden=(64, 32), dropout=0.2, epochs=60, lr=1e-3, batch=64):
         import torch
@@ -58,16 +60,17 @@ class TorchMLP:
         self.epochs, self.lr, self.batch = epochs, lr, batch
 
     def _train(self, X, y, params, epochs, lr, class_w):
+        # κοινός βρόχος εκπαίδευσης· params = ποια βάρη αλλάζουν (όλα ή μόνο του head)
         torch = self.torch
         Xt = torch.tensor(X, dtype=torch.float32)
         yt = torch.tensor(y, dtype=torch.long)
         w = torch.tensor(class_w, dtype=torch.float32)
-        loss_fn = self.nn.CrossEntropyLoss(weight=w)
+        loss_fn = self.nn.CrossEntropyLoss(weight=w)          # βάρη τάξεων -> οι σπάνιες μετράνε περισσότερο
         opt = torch.optim.Adam(params, lr=lr, weight_decay=1e-4)
         n = len(X)
         for _ in range(epochs):
-            perm = self.rng.permutation(n)
-            for i in range(0, n, self.batch):
+            perm = self.rng.permutation(n)                    # ανακάτεμα σε κάθε εποχή
+            for i in range(0, n, self.batch):                 # mini-batches των 64
                 b = torch.as_tensor(perm[i:i + self.batch], dtype=torch.long)
                 opt.zero_grad()
                 loss = loss_fn(self.head(self.encoder(Xt[b])), yt[b])
@@ -76,33 +79,35 @@ class TorchMLP:
 
     def fit(self, X, y):
         cw = class_weights(y)
-        self.encoder.train(); self.head.train()
+        self.encoder.train(); self.head.train()               # train mode -> ενεργό dropout
         self._train(X, y, list(self.encoder.parameters()) + list(self.head.parameters()), self.epochs, self.lr, cw)
         return self
 
     def finetune(self, X, y, epochs=20, lr=5e-4):
         """Transfer learning: ο encoder «παγώνει», εκπαιδεύεται μόνο το head με τα δεδομένα βαθμονόμησης
         (μαζί με ένα μικρό δείγμα «υπενθύμισης» από τους άλλους οδηγούς, βλ. mix_replay)."""
+        # επιστρέφει ΝΕΟ μοντέλο, το γενικό μένει όπως ήταν (χρειάζεται για το "global")
         import copy
         m = copy.copy(self)                       # ρηχό αντίγραφο (τα modules torch/nn δεν αντιγράφονται)
         m.encoder = copy.deepcopy(self.encoder)   # πλήρες αντίγραφο μόνο των βαρών του δικτύου
         m.head = copy.deepcopy(self.head)
         m.rng = np.random.default_rng(self.rng.integers(1 << 31))
         for p in m.encoder.parameters():
-            p.requires_grad = False
+            p.requires_grad = False               # ο encoder δεν αλλάζει
         m.encoder.eval(); m.head.train()
-        m._train(X, y, list(m.head.parameters()), epochs, lr, class_weights(y))
+        m._train(X, y, list(m.head.parameters()), epochs, lr, class_weights(y))   # μικρότερο lr, λιγότερες εποχές
         return m
 
     def predict_proba(self, X):
         torch = self.torch
-        self.encoder.eval(); self.head.eval()
+        self.encoder.eval(); self.head.eval()     # eval -> χωρίς dropout
         with torch.no_grad():
             return torch.softmax(self.head(self.encoder(torch.tensor(X, dtype=torch.float32))), dim=1).numpy()
 
 
 class SklearnMLP:
     """Εναλλακτική χωρίς PyTorch (ίδια αρχιτεκτονική). Το fine-tuning ενημερώνει όλο το δίκτυο με partial_fit."""
+    # ΠΡΟΣΟΧΗ: εδώ το finetune δεν παγώνει τον encoder, άρα δεν είναι ακριβώς το ίδιο πείραμα
 
     def __init__(self, n_in, seed=SEED, hidden=(64, 32), epochs=60, **_):
         from sklearn.neural_network import MLPClassifier
@@ -122,6 +127,7 @@ class SklearnMLP:
         return m
 
     def predict_proba(self, X):
+        # όπως full_proba του ul_dd_baseline: πάντα 3 στήλες
         p = np.zeros((len(X), N_CLASSES))
         p[:, self.m.classes_.astype(int)] = self.m.predict_proba(X)
         return p
@@ -131,13 +137,16 @@ def mix_replay(Xca, yca, Xtr, ytr, rng, ratio=3):
     """Τα πρώτα k λεπτά μιας οδήγησης έχουν συνήθως 1 μόνο τάξη. Αν το head εκπαιδευτεί μόνο σε αυτά,
     «ξεχνά» τις άλλες τάξεις. Γι' αυτό προσθέτουμε ratio x n τυχαία παράθυρα από τους άλλους οδηγούς
     (experience replay) και επαναλαμβάνουμε τα παράθυρα του νέου οδηγού ώστε να είναι το 50%."""
+    # (το φαινόμενο λέγεται catastrophic forgetting)
     n = len(Xca)
     r = rng.choice(len(Xtr), size=min(len(Xtr), ratio * n), replace=False)
-    Xc, yc = np.repeat(Xca, ratio, axis=0), np.repeat(yca, ratio)
+    Xc, yc = np.repeat(Xca, ratio, axis=0), np.repeat(yca, ratio)   # κάθε παράθυρο του νέου οδηγού x3
     return np.vstack([Xc, Xtr[r]]), np.concatenate([yc, ytr[r]])
 
 
 def class_weights(y):
+    # balanced βάρη μόνο για τις τάξεις που υπάρχουν, οι υπόλοιπες 1
+    # (το compute_class_weight σκάει αν του δώσεις τάξη που δεν υπάρχει)
     present = np.unique(y)
     w = np.ones(N_CLASSES)
     w[present] = compute_class_weight("balanced", classes=present, y=y)
@@ -146,12 +155,14 @@ def class_weights(y):
 
 # ----------------------------------------------------------------------------- δεδομένα
 def load(path):
+    # χρησιμοποιείται από ΟΛΑ τα επόμενα axis
     df = pd.read_csv(path, dtype={"subject": str, "session": str})
     num = df.select_dtypes("number").columns.drop(["interval", "window", "y"], errors="ignore")
+    # άπειρα και τεράστιες τιμές -> NaN (όπως στο main του ul_dd_baseline)
     v = df[num].to_numpy(float)
     v[~np.isfinite(v) | (np.abs(np.nan_to_num(v, posinf=0, neginf=0)) > 1e9)] = np.nan
     df[num] = v
-    n_win = df.window.max() + 1
+    n_win = df.window.max() + 1                           # παράθυρα ανά 4λεπτο (8 αν window = 30 s)
     df = df.copy()
     df["t_s"] = df.interval * INTERVAL_S + df.window * (INTERVAL_S // n_win)   # χρόνος από την αρχή της οδήγησης
     return df
@@ -169,8 +180,11 @@ def baseline_normalize(X, df, minutes, mode="sessionA"):
     mode="same":     αναφορά = τα πρώτα k λεπτά της ΙΔΙΑΣ οδήγησης (καμία προηγούμενη οδήγηση· ο οδηγός
                      μπορεί να είναι ήδη κουρασμένος στην αρχή της, όπως στην πράξη).
     Αν λείπει αναφορά, χρησιμοποιείται η μέση τιμή όλων των παραθύρων του οδηγού."""
+    # π.χ. HR 85 σε κάποιον με "φυσιολογικό" 70 -> +15· ίδιο +15 και σε κάποιον με 60 -> 75
+    # έτσι το μοντέλο βλέπει την ΑΛΛΑΓΗ από τον εαυτό του και όχι την απόλυτη τιμή
     Xn = X.copy()
     early = (df.t_s < minutes * 60).to_numpy()
+    # units = ομάδες γραμμών που παίρνουν την ίδια αναφορά (ανά οδήγηση ή ανά οδηγό)
     if mode == "same":
         units = [((df.subject == s) & (df.session == ss)).to_numpy()
                  for s, ss in df[["subject", "session"]].drop_duplicates().itertuples(index=False)]
@@ -182,7 +196,7 @@ def baseline_normalize(X, df, minutes, mode="sessionA"):
         else:
             base = rows & (df.session == "A").to_numpy() & early
         subj_rows = (df.subject == df.subject[rows].iloc[0]).to_numpy()
-        ref = X[base] if base.sum() >= 2 else X[subj_rows]
+        ref = X[base] if base.sum() >= 2 else X[subj_rows]   # εφεδρικά: όλα τα παράθυρα του οδηγού
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             mu = np.nanmean(ref, axis=0)
@@ -193,6 +207,7 @@ def baseline_normalize(X, df, minutes, mode="sessionA"):
 
 def prep(Xtr, Xte_list):
     """Συμπλήρωση με διάμεσο και τυποποίηση με στατιστικά ΜΟΝΟ του train."""
+    # το νευρωνικό θέλει τυποποιημένα δεδομένα χωρίς NaN
     imp = SimpleImputer(strategy="median", keep_empty_features=True).fit(Xtr)
     sc = StandardScaler().fit(imp.transform(Xtr))
     f = lambda Z: np.nan_to_num(sc.transform(imp.transform(Z)))
@@ -209,7 +224,7 @@ def run(df, minutes_list, Model, seeds, baseline="sessionA"):
     records = []
     subjects = sorted(np.unique(groups))
 
-    for k_min in minutes_list:
+    for k_min in minutes_list:                 # για κάθε διάρκεια βαθμονόμησης (2, 4, 8 λεπτά)
         cal = calib_mask(df, k_min)
         Xnorm = {b: baseline_normalize(Xraw[b], df, k_min, baseline) for b in BRANCHES}
         for si, s in enumerate(subjects, 1):
@@ -222,11 +237,12 @@ def run(df, minutes_list, Model, seeds, baseline="sessionA"):
                 continue
             probs = {}                          # (κλάδος, μέθοδος) -> πιθανότητες στο te
             for b in BRANCHES:
+                # raw -> global / finetune,  norm -> norm / norm+finetune
                 for kind, X in (("raw", Xraw[b]), ("norm", Xnorm[b])):
                     trb = tr & avail[b]
                     Xtr, (Xte, Xca) = prep(X[trb], [X[te], X[ca]])
                     P_g, P_f = [], []
-                    for seed in seeds:
+                    for seed in seeds:         # μέσος όρος πολλών seeds (το νευρωνικό είναι ασταθές)
                         m = Model(Xtr.shape[1], seed=seed).fit(Xtr, y[trb])
                         P_g.append(m.predict_proba(Xte))
                         ok = avail[b][ca]
@@ -234,7 +250,7 @@ def run(df, minutes_list, Model, seeds, baseline="sessionA"):
                             Xf, yf = mix_replay(Xca[ok], y[ca][ok], Xtr, y[trb], np.random.default_rng(seed))
                             P_f.append(m.finetune(Xf, yf).predict_proba(Xte))
                         else:
-                            P_f.append(P_g[-1])
+                            P_f.append(P_g[-1])        # χωρίς δεδομένα βαθμονόμησης -> ίδιο με το γενικό
                     Pg, Pf = np.mean(P_g, 0), np.mean(P_f, 0)
                     Pg[~avail[b][te]] = np.nan; Pf[~avail[b][te]] = np.nan
                     tag = "global" if kind == "raw" else "norm"
@@ -246,6 +262,7 @@ def run(df, minutes_list, Model, seeds, baseline="sessionA"):
             def log(method, P):
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore")
+                    # αν δεν υπάρχει καμία πιθανότητα -> Medium (1) ως ουδέτερη πρόβλεψη
                     pred = np.where(np.isnan(P).all(1), 1, np.nan_to_num(P, nan=-1).argmax(1))
                 for i, p in zip(idx, pred):
                     records.append((k_min, method, s, int(y[i]), int(p)))
@@ -259,7 +276,7 @@ def run(df, minutes_list, Model, seeds, baseline="sessionA"):
                 stack = np.stack([probs[("bio", tag)], probs[("veh", "global")], probs[("face", "global")]])
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore")
-                    log(f"fusion_bioOnly_{tag}", np.nanmean(stack, axis=0))
+                    log(f"fusion_bioOnly_{tag}", np.nanmean(stack, axis=0))   # soft voting
                     # σύντηξη: εξατομίκευση σε ΟΛΟΥΣ τους κλάδους
                     stack = np.stack([probs[(b, tag)] for b in BRANCHES])
                     log(f"fusion_all_{tag}", np.nanmean(stack, axis=0))
@@ -284,6 +301,7 @@ def summarize(res):
         r = {"k_min": k, "method": m, "n_windows": len(g), **metrics(g.y_true.to_numpy(), g.y_pred.to_numpy())}
         f1s = {}
         for s, gs in g.groupby("subject"):
+            # F1 ανά οδηγό μόνο στις τάξεις που έχει
             f1s[s] = f1_score(gs.y_true, gs.y_pred, labels=np.unique(gs.y_true), average="macro", zero_division=0)
             per.append({"k_min": k, "method": m, "subject": s, "macro_F1": f1s[s]})
         r["subj_F1_mean"], r["subj_F1_std"] = np.mean(list(f1s.values())), np.std(list(f1s.values()))
@@ -291,6 +309,7 @@ def summarize(res):
     summ = pd.DataFrame(rows)
     per = pd.DataFrame(per)
     # κάθε εξατομικευμένη μέθοδος έναντι της αντίστοιχης χωρίς εξατομίκευση (ανά οδηγό)
+    # π.χ. bio_norm έναντι bio_global
     tests = []
     for k in per.k_min.unique():
         pk = per[per.k_min == k].pivot(index="subject", columns="method", values="macro_F1")
@@ -312,6 +331,7 @@ def summarize(res):
 
 
 def plot(summ, path):
+    # καμπύλη βαθμονόμησης: F1 ανάλογα με τα λεπτά k
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -326,7 +346,7 @@ def plot(summ, path):
         for tag, (c, mk) in styles.items():
             s = summ[summ.method == prefix + tag].sort_values("k_min")
             ax.plot(s.k_min, s.macro_F1, marker=mk, color=c, label=tag)
-        ax.axhline(1 / 3, ls="--", color="#777777", lw=1)
+        ax.axhline(1 / 3, ls="--", color="#777777", lw=1)   # τυχαία απόδοση
         ax.set_title(title); ax.set_xlabel("Λεπτά βαθμονόμησης (k)")
         ax.spines[["top", "right"]].set_visible(False)
     axes[0].set_ylabel("Macro F1 σε νέο οδηγό (LOSO)")
