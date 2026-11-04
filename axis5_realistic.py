@@ -44,7 +44,7 @@ warnings.filterwarnings("ignore")
 BR, NC = ul.BRANCHES, ul.N_CLASSES
 WIN_MIN = 0.5                    # ένα παράθυρο = 30 s
 PROPOSED = "late_meta_reliability"
-NEW = "late_meta_realistic"
+NEW = "late_meta_realistic"      # με αυτήν συγκρίνονται όλες στον Wilcoxon
 WORK = {PROPOSED: "Η παρούσα εργασία (όπως πριν)", "late_meta_reliability_LOCF": "Υβριδική (όπως πριν)",
         NEW: "ΝΕΟ: ρεαλιστικές βλάβες + ηλικία LOCF", "late_meta_realistic_temporal": "ΝΕΟ: + χρονικό πλαίσιο 1 λεπ.",
         "late_meta_dropout": "Krishna et al.", "late_meta_dropout_realistic": "Krishna et al. + ρεαλιστικές βλάβες",
@@ -54,19 +54,20 @@ WORK = {PROPOSED: "Η παρούσα εργασία (όπως πριν)", "late_
 # ----------------------------------------------------------------------------- βλάβες
 def block_mask(df, seg, order, minutes, rng, rows=None):
     """Ένας τυχαίος αισθητήρας ανά οδήγηση χάνεται για `minutes` συνεχόμενα λεπτά (ή όλη την οδήγηση)."""
+    # επιστρέφει (n, 3) True/False: True = ο κλάδος χάνεται σε αυτό το παράθυρο
     n = len(df)
     drop = np.zeros((n, len(BR)), bool)
-    L = int(round(minutes / WIN_MIN))
+    L = int(round(minutes / WIN_MIN))             # λεπτά -> πλήθος παραθύρων (π.χ. 16 λεπτά = 32)
     sorted_idx = order
     for sg in np.unique(seg):
-        idx = sorted_idx[seg[sorted_idx] == sg]
+        idx = sorted_idx[seg[sorted_idx] == sg]   # παράθυρα της οδήγησης, με χρονική σειρά
         if rows is not None and not np.isin(idx, rows).any():
             continue
-        b = rng.integers(len(BR))
-        if L >= len(idx):
+        b = rng.integers(len(BR))                 # ποιος αισθητήρας χαλάει
+        if L >= len(idx):                         # minutes=1000 -> όλη η οδήγηση
             drop[idx, b] = True
         else:
-            st = rng.integers(0, len(idx) - L + 1)
+            st = rng.integers(0, len(idx) - L + 1)   # τυχαία αρχή
             drop[idx[st:st + L], b] = True
     return drop
 
@@ -74,24 +75,26 @@ def block_mask(df, seg, order, minutes, rng, rows=None):
 def locf_with_age(P_list, flags, Q, seg, order, max_age):
     """Στα κενά: η τελευταία πρόβλεψη του κλάδου στην ίδια οδήγηση, αν είναι έως max_age λεπτά παλιά.
     Επιστρέφει P, flags, Q και την ηλικία (λεπτά / max_age, 0 = φρέσκια μέτρηση, 1 = δεν καλύφθηκε)."""
+    # (η επέκτασή του locf_ext στο axis6 μεταφέρει και την ανωμαλία)
     P2 = [p.copy() for p in P_list]
     f2, Q2 = flags.copy(), Q.copy()
     age = np.zeros((len(flags), len(BR)))
     o = order
     for b in range(len(BR)):
+        # (το last_t δεν χρησιμοποιείται· το cnt ορίζεται στο πρώτο βήμα επειδή last_seg ξεκινά None)
         last, last_seg, last_t = None, None, 0
         for pos, i in enumerate(o):
-            if last_seg != seg[i]:
+            if last_seg != seg[i]:                # νέα οδήγηση -> από την αρχή
                 last, last_seg, cnt = None, seg[i], 0
             if f2[i, b]:
                 last, cnt = P2[b][i].copy(), 0
                 continue
             cnt += 1
-            a = cnt * WIN_MIN
+            a = cnt * WIN_MIN                     # λεπτά χωρίς μέτρηση
             if last is not None and a <= max_age:
                 P2[b][i] = last
                 f2[i, b] = 1
-                Q2[i, b] = Q[i, b] if Q[i, b] > 0 else 0.0
+                Q2[i, b] = Q[i, b] if Q[i, b] > 0 else 0.0   # η ποιότητα μένει όπως ήταν (συνήθως 0)
                 age[i, b] = a / max_age
             else:
                 age[i, b] = 1.0
@@ -100,6 +103,8 @@ def locf_with_age(P_list, flags, Q, seg, order, max_age):
 
 def degrade(P_list, Q, rows_b, rng):
     """Κακό σήμα σε επίπεδο πιθανοτήτων (μόνο για την εκπαίδευση): ανάμειξη με ομοιόμορφη + χαμηλή ποιότητα."""
+    # alpha = 0.4–0.9: όσο μεγαλύτερο, τόσο πιο κοντά στο 1/3-1/3-1/3 ("δεν ξέρω")
+    # και η ποιότητα πέφτει ανάλογα, ώστε ο meta να μάθει: χαμηλή ποιότητα -> μην εμπιστεύεσαι
     P2 = [p.copy() for p in P_list]
     Q2 = Q.copy()
     for b, rows in rows_b.items():
@@ -113,12 +118,14 @@ def degrade(P_list, Q, rows_b, rng):
 
 def realistic_copies(Pfull, flags, Q, df, seg, order, rng, max_age):
     """Αντίγραφα εκπαίδευσης: τυχαία κενά, συνεχόμενες βλάβες διαφόρων διαρκειών, κακό σήμα, LOCF με ηλικία."""
+    # σύνολο 6 αντίγραφα, το καθένα = (P, flags, Q, age)
     n = len(df)
     out = []
     # (α) πλήρη + τυχαία κενά (όπως πριν)
     out.append((Pfull, flags, Q, np.zeros((n, len(BR)))))
     out.append(locf_with_age(*apply_mask(Pfull, flags, Q, rng.random((n, len(BR))) < 0.3), seg, order, max_age))
     # (β) συνεχόμενες βλάβες
+    # 4 λεπτά, 16 λεπτά, όλη η οδήγηση
     for mins in (4, 16, 1000):
         out.append(locf_with_age(*apply_mask(Pfull, flags, Q, block_mask(df, seg, order, mins, rng)),
                                  seg, order, max_age))
@@ -145,6 +152,7 @@ def run(df, k_min, baseline, trees, max_age, noise_sd):
     cal = a3.calib_mask(df, k_min)
     rng = np.random.default_rng(ul.SEED)
     srng = np.random.default_rng(ul.SEED + 7)          # ίδια σενάρια για όλες τις μεθόδους
+    # μάσκες σεναρίων ελέγχου (40 -> 1000 = όλη η οδήγηση)
     scen = {"all": np.zeros((n, len(BR)), bool)}
     for p in (30, 60):
         scen[f"random{p}"] = srng.random((n, len(BR))) < p / 100
@@ -152,7 +160,7 @@ def run(df, k_min, baseline, trees, max_age, noise_sd):
         scen[f"outage{m}"] = block_mask(df, seg, order, m if m < 40 else 1000, srng)
     for m in (16, 40):
         scen[f"noise{m}"] = block_mask(df, seg, order, m if m < 40 else 1000, srng)
-    noise = {b: srng.normal(0, 1, X[b].shape) for b in BR}
+    noise = {b: srng.normal(0, 1, X[b].shape) for b in BR}   # θόρυβος έτοιμος, ίδιος για όλους
     rec = []
 
     for si, s in enumerate(sorted(np.unique(groups)), 1):
@@ -162,6 +170,7 @@ def run(df, k_min, baseline, trees, max_age, noise_sd):
         te = np.where((groups == s) & ~cal)[0]
         if len(te) == 0:
             continue
+        # κλάδοι: OOF στο train + μοντέλο για τον νέο οδηγό (όπως στο ul_dd_baseline)
         Pfull = [np.full((n, NC), np.nan) for _ in BR]
         models = {}
         for bi, b in enumerate(BR):
@@ -174,17 +183,19 @@ def run(df, k_min, baseline, trees, max_age, noise_sd):
         Q = Qall * flags
 
         # --- εκπαίδευση
+        # base = όπως πριν: πλήρη + 2 αντίγραφα με 20% τυχαίο dropout
         base = [(Pfull, flags, Q)] + [apply_mask(Pfull, flags, Q, rng.random((n, len(BR))) < 0.2) for _ in range(2)]
         yb = np.concatenate([y[tr]] * len(base))
         meta = ul.fit_meta(np.vstack([ul.reliability_features([p[tr] for p in P], f[tr], q[tr]) for P, f, q in base]), yb)
         meta_drop = ul.fit_meta(np.vstack([ul.meta_features([p[tr] for p in P], f[tr]) for P, f, _ in base]), yb)
+        # real = τα νέα, ρεαλιστικά αντίγραφα
         real = realistic_copies(Pfull, flags, Q, df, seg, order, rng, max_age)
         yr = np.concatenate([y[tr]] * len(real))
         feats_r = lambda P, f, q, a: np.hstack([ul.reliability_features([p[tr] for p in P], f[tr], q[tr]), a[tr]])
-        meta_r = ul.fit_meta(np.vstack([feats_r(*c) for c in real]), yr)
+        meta_r = ul.fit_meta(np.vstack([feats_r(*c) for c in real]), yr)                     # + ηλικία
         meta_rt = ul.fit_meta(np.vstack([np.hstack([feats_r(*c), temporal_block(c[0], seg, order, 2)[tr]])
-                                         for c in real]), yr)
-        meta_dr = ul.fit_meta(np.vstack([ul.meta_features([p[tr] for p in P], f[tr]) for P, f, _, _ in real]), yr)
+                                         for c in real]), yr)                                # + χρόνος
+        meta_dr = ul.fit_meta(np.vstack([ul.meta_features([p[tr] for p in P], f[tr]) for P, f, _, _ in real]), yr)   # Krishna
 
         # --- έλεγχος
         pos = {i: j for j, i in enumerate(sub)}
@@ -200,13 +211,14 @@ def run(df, k_min, baseline, trees, max_age, noise_sd):
                     if len(rows) and b in models:
                         Xn = X[b][rows] + noise_sd * sd[b] * noise[b][rows]
                         P_t[bi][rows] = ul.full_proba(models[b], Xn)
-                        Q_t[rows, bi] = 0.3
+                        Q_t[rows, bi] = 0.3     # εδώ ο δείκτης ποιότητας "ξέρει" ότι κάτι πάει στραβά
             else:
                 drop[sub] = M[sub]
             P_, f_, Q_ = apply_mask(P_t, flags, Q_t, drop)
             PL, fL, QL, aL = locf_with_age(P_, f_, Q_, seg, order, max_age)
             QLh = np.where((fL == 1) & (f_ == 0), 0.5 * Qall, QL)         # ο κανόνας της υβριδικής: ποιότητα × 0,5
             R = lambda P, f, q: ul.reliability_features([p[sub] for p in P], f[sub], q[sub])
+            # P_/f_/Q_ = χωρίς LOCF, PL/fL/QL = με LOCF
             preds = {
                 PROPOSED: meta.predict(R(P_, f_, Q_))[ite],
                 "late_meta_reliability_LOCF": meta.predict(R(PL, fL, QLh))[ite],
@@ -242,6 +254,7 @@ def main():
     res.to_csv(f"{a.out}/realistic_predictions.csv", index=False)
 
     def met(g):
+        # false_alarm = Alert που βγήκαν High
         yt, yp = g.y_true.to_numpy(), g.y_pred.to_numpy()
         return pd.Series({"macro_F1": f1_score(yt, yp, average="macro", labels=[0, 1, 2], zero_division=0),
                           "kappa": cohen_kappa_score(yt, yp, weights="quadratic"),
@@ -264,6 +277,7 @@ def main():
     rows = []
     for sc in order_sc:
         t = ps[ps.scenario == sc].pivot_table(index="subject", columns="method", values="F1")
+        # NEW έναντι όλων των άλλων (χωρίς Holm)
         for m in t.columns:
             if m == NEW:
                 continue
