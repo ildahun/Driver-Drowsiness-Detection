@@ -54,8 +54,8 @@ warnings.filterwarnings("ignore")
 BR = ul.BRANCHES
 NC = ul.N_CLASSES
 PROPOSED = "late_meta_reliability"
-RATES = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6]
-REAL_GAP_SESSIONS = [("A", "D"), ("N", "D"), ("O", "D")]
+RATES = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6]          # ποσοστά τυχαίων κενών στο test
+REAL_GAP_SESSIONS = [("A", "D"), ("N", "D"), ("O", "D")]   # οδηγήσεις με πολλά πραγματικά κενά
 OUTAGES = [4, 8, 16, 40]            # λεπτά συνεχόμενης βλάβης ενός αισθητήρα
 HYBRID = PROPOSED + "_LOCF"
 WORK = {PROPOSED: "Η παρούσα εργασία", HYBRID: "Η παρούσα εργασία + LOCF", "late_meta_dropout": "Krishna et al.",
@@ -69,23 +69,25 @@ WORK = {PROPOSED: "Η παρούσα εργασία", HYBRID: "Η παρούσα
 
 def locf(Xfull, df):
     """Last observation carried forward μέσα σε κάθε οδήγηση (με χρονική σειρά)· ό,τι μένει κενό μένει NaN."""
+    # για την πρώιμη σύντηξη: κάθε στήλη χωριστά, χωρίς όριο ηλικίας
     out = pd.DataFrame(Xfull, index=df.index)
     order = df.sort_values(["subject", "session", "interval", "window"]).index
-    key = df.loc[order, ["subject", "session"]].astype(str).agg("_".join, axis=1)
-    filled = out.loc[order].groupby(key.values).ffill()
-    return filled.loc[df.index].to_numpy()
+    key = df.loc[order, ["subject", "session"]].astype(str).agg("_".join, axis=1)   # π.χ. "A_D"
+    filled = out.loc[order].groupby(key.values).ffill()      # ffill = γέμισε με την προηγούμενη τιμή
+    return filled.loc[df.index].to_numpy()                   # πίσω στην αρχική σειρά
 
 
 def locf_age(Xb, df):
     """LOCF για έναν κλάδο: συμπληρωμένος πίνακας + «ηλικία» (σε παράθυρα) της τιμής που αντιγράφηκε."""
+    # για την υβριδική: ολόκληρη η γραμμή του κλάδου + πόσα παράθυρα πριν ήταν η τελευταία καλή
     order = df.sort_values(["subject", "session", "interval", "window"]).index.to_numpy()
     key = (df.subject + "_" + df.session).to_numpy()
     valid = ~np.isnan(Xb).all(axis=1)
     filled = np.full_like(Xb, np.nan)
-    age = np.full(len(Xb), np.inf)
+    age = np.full(len(Xb), np.inf)                           # inf = δεν υπάρχει προηγούμενη τιμή
     last_row, last_key, last_pos = None, None, None
     for pos, i in enumerate(order):
-        if key[i] != last_key:
+        if key[i] != last_key:                               # νέα οδήγηση
             last_row, last_key = None, key[i]
         if valid[i]:
             last_row, last_pos = i, pos
@@ -119,7 +121,7 @@ def main():
     groups = df.subject.to_numpy()
     feat = {b: [c for c in df.columns if c.startswith(f"{b}__")] for b in BR}
     X = {b: df[feat[b]].to_numpy(float) for b in BR}
-    cal = np.zeros(len(df), bool)
+    cal = np.zeros(len(df), bool)                            # χωρίς --normalize: κανένα παράθυρο βαθμονόμησης
     if a.normalize:                                          # Άξονας 3: ατομική κανονικοποίηση
         import axis3_personalization as a3
         n_w = int(df.window.max()) + 1
@@ -127,7 +129,7 @@ def main():
         X = {b: a3.baseline_normalize(X[b], df, a.minutes, a.baseline) for b in BR}
         cal = a3.calib_mask(df, a.minutes)
     Xall = np.hstack([X[b] for b in BR])
-    cols = np.cumsum([0] + [X[b].shape[1] for b in BR])
+    cols = np.cumsum([0] + [X[b].shape[1] for b in BR])     # όρια στηλών κάθε κλάδου μέσα στο Xall
     avail = {b: ~np.isnan(X[b]).all(axis=1) for b in BR}
     qcols = [f"q__{b}" for b in BR]
     Qall = (df[qcols].fillna(0.0).to_numpy(float) if all(c in df for c in qcols)
@@ -154,24 +156,27 @@ def main():
         folds = list(StratifiedKFold(5, shuffle=True, random_state=ul.SEED).split(Xall, y))
 
     # μάσκες (ίδιες για όλες τις μεθόδους → δίκαιη σύγκριση)
+    # φτιάχνονται μία φορά για όλο το df, και κάθε fold παίρνει τις γραμμές του test
     n_win = int(df.window.max()) + 1
     win_min = 4.0 / n_win                                    # διάρκεια παραθύρου σε λεπτά
     tw = (df.interval * n_win + df.window).to_numpy()        # αύξων αριθμός παραθύρου στην οδήγηση
     rng_m = np.random.default_rng(123)
+    # κλειδί μάσκας = (είδος, επίπεδο, επανάληψη)
     masks = {("random", p, r): (rng_m.random((len(df), len(BR))) < p) for p in RATES for r in range(a.repeats)}
     for L in OUTAGES:
-        Lw = int(round(L / win_min))
+        Lw = int(round(L / win_min))                         # λεπτά -> παράθυρα
         for r in range(a.repeats):
             M = np.zeros((len(df), len(BR)), bool)
             for key in np.unique(sess_tag):
                 rows = sess_tag == key
                 n = int(tw[rows].max()) + 1
-                bi = rng_m.integers(len(BR))
-                start = rng_m.integers(0, max(1, n - Lw + 1))
+                bi = rng_m.integers(len(BR))                 # τυχαίος αισθητήρας
+                start = rng_m.integers(0, max(1, n - Lw + 1))   # τυχαία αρχή
                 M[rows & (tw >= start) & (tw < start + Lw), bi] = True
             masks[("outage", L, r)] = M
-    max_age_w = a.max_age / win_min
+    max_age_w = a.max_age / win_min                          # max_age σε παράθυρα
     # LOCF για κάθε μάσκα: (α) για την πρώιμη σύντηξη, όλος ο πίνακας· (β) ανά κλάδο με ηλικία, για την υβριδική
+    # (υπολογίζεται μία φορά εδώ, όχι σε κάθε fold, γιατί είναι αργό)
     locf_cache = {}
     for key, M in masks.items():
         Xm = Xall.copy()
@@ -189,6 +194,7 @@ def main():
     folds = [(tr, te[~cal[te]]) for tr, te in folds]          # έλεγχος μόνο μετά τη βαθμονόμηση
     for k, (tr, te) in enumerate(folds, 1):
         t0 = time.time()
+        # --- κλάδοι (όπως στο ul_dd_baseline)
         Ptr, Pte, bmodels = [], [], []
         for b in BR:
             Ptr.append(ul.branch_oof(X[b][tr], y[tr], groups[tr], avail[b][tr], a.trees, cv=a.cv))
@@ -198,11 +204,12 @@ def main():
             if m is not None and ok.any():
                 p[ok] = ul.full_proba(m, X[b][te][ok])
             Pte.append(p)
-            bmodels.append(m)
+            bmodels.append(m)                                 # κρατιούνται για την υβριδική (νέα πρόβλεψη από LOCF)
         ftr = np.stack([~np.isnan(P[:, 0]) for P in Ptr], 1).astype(int)
         fte = np.stack([~np.isnan(P[:, 0]) for P in Pte], 1).astype(int)
         Qtr, Qte = Qall[tr] * ftr, Qall[te] * fte
 
+        # --- όλα τα μοντέλα, εκπαίδευση μία φορά ανά fold
         copies = ul.dropout_copies(Ptr, ftr, Qtr, rng)
         yd = np.concatenate([y[tr]] * len(copies))
         meta_rel = ul.fit_meta(np.vstack([ul.reliability_features(P, f, Q) for P, f, Q in copies]), yd)
@@ -220,6 +227,7 @@ def main():
 
         rf_kw = dict(n_estimators=a.trees, max_depth=8, min_samples_leaf=5, class_weight="balanced", n_jobs=-1,
                      random_state=ul.SEED)
+        # κλασικοί τρόποι συμπλήρωσης: 0 / kNN (το kNN θέλει τυποποιημένα δεδομένα, γι' αυτό πρώτα scaler)
         early_zero = Pipeline([("imp", SimpleImputer(strategy="constant", fill_value=0.0)),
                                ("rf", RandomForestClassifier(**rf_kw))]).fit(Xall[tr], y[tr])
         early_knn = Pipeline([("sc", StandardScaler()), ("imp", KNNImputer(n_neighbors=5)),
@@ -233,6 +241,7 @@ def main():
                         if (~np.isnan(P[:, 0])).any() else 0.0 for P in Ptr])
 
         def weighted_vote(P_):
+            # σταθερά βάρη ανά κλάδο (όχι ανά παράθυρο, σε αντίθεση με τη rel_vote του axis6)
             S = np.zeros((len(P_[0]), NC))
             for w, P in zip(wts, P_):
                 S += w * np.nan_to_num(P, nan=0.0)
@@ -243,10 +252,11 @@ def main():
             st = np.stack([np.nan_to_num(P, nan=-1.0) for P in P_])        # (κλάδοι, n, C)
             best = st.max(2).argmax(0)                                    # ο πιο σίγουρος διαθέσιμος κλάδος
             out = st[best, np.arange(st.shape[1])].argmax(1)
-            out[(st.max(2) < 0).all(0)] = 1
+            out[(st.max(2) < 0).all(0)] = 1                               # κανένας κλάδος -> Medium
             return out
 
         def predict_all(P_, f_, Q_, Xe, Xe_locf):
+            # όλες οι μέθοδοι στα ίδια (χαλασμένα) δεδομένα· late -> πιθανότητες, early -> χαρακτηριστικά
             return {PROPOSED: meta_rel.predict(ul.reliability_features(P_, f_, Q_)),
                     "late_meta_dropout": meta_drop.predict(ul.meta_features(P_, f_)),
                     "late_soft_voting": ul.soft_vote(P_), "late_hard_voting": ul.hard_vote(P_),
@@ -258,6 +268,7 @@ def main():
                     "late_max_confidence": max_confidence(P_),
                     "late_meta_zero_dropout": meta_zero.predict(ul.to_zero_input(ul.meta_features(P_, f_)))}
 
+        # --- κάθε μάσκα στο test
         for key, M in masks.items():
             kind, lvl, r = key
             Mt = M[te]
@@ -266,6 +277,7 @@ def main():
             f_, Q_ = fte.copy(), Qte.copy()
             Xe = Xall[te].copy()
             for bi in range(len(BR)):
+                # ίδια μάσκα και στις πιθανότητες (late) και στα χαρακτηριστικά (early)
                 P_[bi][Mt[:, bi]] = np.nan
                 f_[Mt[:, bi], bi] = 0
                 Q_[Mt[:, bi], bi] = 0.0
@@ -278,9 +290,10 @@ def main():
                 filled, age = per_branch[bi]
                 sel = (Mt[:, bi] | ~avail[b][te]) & (age[te] <= max_age_w) & ~np.isnan(filled[te]).all(1)
                 if bmodels[bi] is not None and sel.any():
+                    # τα παλιά χαρακτηριστικά ξαναπερνούν από το μοντέλο του κλάδου
                     Ph[bi][sel] = ul.full_proba(bmodels[bi], filled[te][sel])
                     fh[sel, bi] = 1
-                    Qh[sel, bi] = 0.5 * Qall[te][sel, bi]
+                    Qh[sel, bi] = 0.5 * Qall[te][sel, bi]                    # σταθερός κανόνας: μισή ποιότητα
             preds[HYBRID] = meta_rel.predict(ul.reliability_features(Ph, fh, Qh))
             for mth, pr in preds.items():
                 for i, pp in zip(te, pr):
@@ -296,7 +309,8 @@ def main():
     # (α) καμπύλη
     allrec = pd.DataFrame(rec_curve, columns=["kind", "p", "rep", "method", "subject", "y_true", "y_pred"])
     cur = allrec[allrec.kind == "random"]
-    out_ = allrec[allrec.kind == "outage"]
+    out_ = allrec[allrec.kind == "outage"]          # εδώ η στήλη "p" = λεπτά βλάβης
+    # F1 ανά επανάληψη, μετά μέσος ± SD των επαναλήψεων
     curve = (cur.groupby(["method", "p", "rep"]).apply(f1).rename("F1").reset_index()
              .groupby(["method", "p"]).F1.agg(["mean", "std"]).reset_index())
     tab = curve.pivot(index="method", columns="p", values="mean")
@@ -322,13 +336,16 @@ def main():
     print(otab.round(3).to_string())
 
     # Wilcoxon ανά οδηγό: τυχαία 30% / 60% και βλάβη 16 / 40 λεπτών
+    # (F1 ανά οδηγό με όλες τις επαναλήψεις μαζί)
     rows = []
     for kind, lvl, label, src in [("random", 0.3, "τυχαία 30%", cur), ("random", 0.6, "τυχαία 60%", cur),
                                   ("outage", 16, "βλάβη 16 λεπτών", out_), ("outage", 40, "βλάβη 40 λεπτών", out_)]:
         ps = (src[src.p == lvl].groupby(["method", "subject"]).apply(f1).rename("F1").reset_index()
               .pivot(index="subject", columns="method", values="F1"))
+        # συγκρίσεις: η προτεινόμενη έναντι όλων, και η υβριδική έναντι όλων (μαζί και της προτεινόμενης)
         for ref in (PROPOSED, HYBRID):
             for m in ps.columns:
+                # παραλείπεται: σύγκριση με τον εαυτό της, και PROPOSED έναντι HYBRID (γίνεται ήδη ανάποδα)
                 if m in (PROPOSED, HYBRID) and m == ref or (ref == PROPOSED and m == HYBRID):
                     continue
                 d = (ps[ref] - ps[m]).dropna()
@@ -346,6 +363,7 @@ def main():
     print(st.round(4).to_string(index=False))
 
     # (β) πραγματικά κενά
+    # οι προβλέψεις χωρίς τεχνητά κενά (p = 0), χωρισμένες σε παράθυρα με / χωρίς πραγματικό κενό
     real = pd.DataFrame(rec_real, columns=["method", "subject", "session", "gap", "y_true", "y_pred"])
     out = []
     for mth, g in real.groupby("method"):
@@ -353,6 +371,7 @@ def main():
                "F1_complete": f1(g[~g.gap]) if (~g.gap).any() else np.nan,
                "F1_real_gap": f1(g[g.gap]) if g.gap.any() else np.nan, "n_gap_windows": int(g.gap.sum())}
         for s, ss in REAL_GAP_SESSIONS:
+            # accuracy και όχι F1, γιατί μια οδήγηση έχει λίγες τάξεις
             gs = g[g.session == f"{s}_{ss}"]
             row[f"acc_{s}_{ss}"] = accuracy_score(gs.y_true, gs.y_pred) if len(gs) else np.nan
         out.append(row)
@@ -361,6 +380,7 @@ def main():
     print("\n=== Πραγματικά κενά στα δεδομένα (χωρίς τεχνητή αφαίρεση) ===")
     print(rt.round(3).to_string(index=False))
 
+    # γράφημα: καμπύλη F1 ανάλογα με το % κενών, η προτεινόμενη πιο έντονη
     try:
         import matplotlib
         matplotlib.use("Agg")
