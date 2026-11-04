@@ -49,7 +49,9 @@ WORK = {PROPOSED: "Η παρούσα εργασία", "late_meta_reliability_smo
 # ----------------------------------------------------------------------------- χρόνος
 def segments(df):
     """Σειρά των παραθύρων στον χρόνο και ταυτότητα οδήγησης (οδηγός + session)."""
+    # seg: ένας αριθμός ανά οδήγηση (π.χ. A_A -> 0, A_D -> 1, ...)
     seg = pd.factorize(df.subject.astype(str) + "_" + df.session.astype(str))[0]
+    # order: δείκτες γραμμών ταξινομημένοι πρώτα κατά οδήγηση, μετά κατά χρόνο (το lexsort ταξινομεί με το ΤΕΛΕΥΤΑΙΟ κλειδί πρώτα)
     order = np.lexsort((df.t_s.to_numpy(), seg))
     return seg, order
 
@@ -58,10 +60,12 @@ def past_mean(M, seg, order, k):
     """Για κάθε γραμμή: μέσος όρος (αγνοώντας NaN) των k ΠΡΟΗΓΟΥΜΕΝΩΝ γραμμών της ίδιας οδήγησης,
     και πόσες από αυτές ήταν διαθέσιμες. M: (n, c) με NaN όπου λείπει."""
     n, c = M.shape
-    d = pd.DataFrame(M[order], columns=range(c))
-    g = d.groupby(seg[order], sort=False)
+    d = pd.DataFrame(M[order], columns=range(c))     # σε χρονική σειρά
+    g = d.groupby(seg[order], sort=False)            # ανά οδήγηση, ώστε να μη "μπαίνει" παρελθόν από άλλη οδήγηση
+    # shift(1): μόνο τα προηγούμενα, ΟΧΙ το τρέχον παράθυρο (αλλιώς θα ήταν διπλό)
     mean = g.transform(lambda s: s.shift(1).rolling(k, min_periods=1).mean()).to_numpy()
     cnt = g[0].transform(lambda s: s.shift(1).notna().rolling(k, min_periods=1).sum()).fillna(0).to_numpy()
+    # πίσω στην αρχική σειρά γραμμών
     out_m, out_c = np.full((n, c), np.nan), np.zeros(n)
     out_m[order], out_c[order] = mean, cnt
     return out_m, out_c
@@ -69,6 +73,7 @@ def past_mean(M, seg, order, k):
 
 def smooth_with_past(Pcur, seg, order, k):
     """Εξομάλυνση της εξόδου: μέσος όρος της τρέχουσας και των k-1 προηγούμενων πιθανοτήτων."""
+    # διαφορά από το temporal_block: εδώ ο meta δεν "μαθαίνει" τίποτα, απλώς παίρνω μέσο όρο στο τέλος
     d = pd.DataFrame(Pcur[order])
     sm = d.groupby(seg[order], sort=False).transform(lambda s: s.rolling(k, min_periods=1).mean()).to_numpy()
     out = np.empty_like(Pcur)
@@ -78,9 +83,11 @@ def smooth_with_past(Pcur, seg, order, k):
 
 def temporal_block(Pfull, seg, order, k):
     """Χρονικά χαρακτηριστικά: για κάθε κλάδο, οι μέσες πιθανότητες στα k προηγούμενα παράθυρα + το πλήθος τους."""
+    # ανά κλάδο 3 + 1 στήλες -> σύνολο 12
     cols = []
     for P in Pfull:
         m, c = past_mean(P, seg, order, k)
+        # χωρίς παρελθόν -> 1/3 ("δεν ξέρω"), πλήθος / k -> 0..1
         cols += [np.nan_to_num(m, nan=1.0 / NC), (c / k)[:, None]]
     return np.hstack(cols)
 
@@ -88,6 +95,7 @@ def temporal_block(Pfull, seg, order, k):
 # ----------------------------------------------------------------------------- κενά
 def apply_mask(P_list, flags, Q, drop):
     """drop: (n, 3) boolean · ο κλάδος b «χάνεται» όπου drop[:, b]."""
+    # γενική εκδοχή του mask_branch του ul_dd_baseline: ανά γραμμή και όχι για όλο τον κλάδο
     P2 = [p.copy() for p in P_list]
     f2, Q2 = flags.copy(), Q.copy()
     for b in range(len(BR)):
@@ -98,6 +106,7 @@ def apply_mask(P_list, flags, Q, drop):
 
 
 def scenario_masks(n, rng):
+    # all = τίποτα, no_X = ο κλάδος X λείπει παντού, randomP = P% τυχαία κενά
     m = {"all": np.zeros((n, len(BR)), bool)}
     for bi, b in enumerate(BR):
         d = np.zeros((n, len(BR)), bool); d[:, bi] = True
@@ -143,6 +152,7 @@ def run(df, k_min, baseline, trees, ctx):
         Q = Qall * flags
 
         # --- εκπαίδευση: modality dropout · τα χρονικά χαρακτηριστικά από το ίδιο «χαλασμένο» αντίγραφο
+        # (αν λείπει ένας κλάδος τώρα, λείπει και στο παρελθόν του ίδιου αντιγράφου -> συνεπές)
         copies = [(Pfull, flags, Q)]
         for _ in range(2):
             copies.append(apply_mask(Pfull, flags, Q, rng.random((n, len(BR))) < 0.2))
@@ -150,11 +160,13 @@ def run(df, k_min, baseline, trees, ctx):
         meta = ul.fit_meta(np.vstack([ul.reliability_features([p[tr] for p in P], f[tr], q[tr])
                                       for P, f, q in copies]), yd)
         meta_drop = ul.fit_meta(np.vstack([ul.meta_features([p[tr] for p in P], f[tr]) for P, f, _ in copies]), yd)
+        # ένας meta για κάθε μήκος χρονικού πλαισίου
         meta_t = {}
         for k in ctx:
             Xt = [np.hstack([ul.reliability_features([p[tr] for p in P], f[tr], q[tr]),
                              temporal_block(P, seg, order, k)[tr]]) for P, f, q in copies]
             meta_t[k] = ul.fit_meta(np.vstack(Xt), yd)
+        # stacking LR: μόνο στα πλήρη δεδομένα, χωρίς dropout
         stack_lr = Pipeline([("sc", StandardScaler()), ("lr", LogisticRegression(max_iter=2000,
                              class_weight="balanced"))]).fit(
             np.nan_to_num(ul.meta_features([p[tr] for p in Pfull], flags[tr]), nan=1.0 / NC), y[tr])
@@ -167,9 +179,10 @@ def run(df, k_min, baseline, trees, ctx):
             Ms = ul.meta_features([p[sub] for p in P_], f_[sub])
             pos = {i: j for j, i in enumerate(sub)}
             ite = np.array([pos[i] for i in te])
+            # πιθανότητες σε πίνακα μεγέθους n, ώστε να δουλεύει το smooth_with_past με seg/order
             pr_meta = np.zeros((n, NC)); pr_meta[sub] = meta.predict_proba(Rs)
             pr_drop = np.zeros((n, NC)); pr_drop[sub] = meta_drop.predict_proba(Ms)
-            k0 = max(ctx) if 4 not in ctx else 4
+            k0 = max(ctx) if 4 not in ctx else 4             # εξομάλυνση με 4 παράθυρα (2 λεπτά) αν υπάρχει
             preds = {
                 PROPOSED: pr_meta[te].argmax(1),
                 "late_meta_reliability_smooth": smooth_with_past(pr_meta, seg, order, k0)[te].argmax(1),
@@ -195,7 +208,7 @@ def metrics(g):
                       "macro_F1": f1_score(yt, yp, average="macro", labels=[0, 1, 2], zero_division=0),
                       "recall_High": recall_score(yt, yp, labels=[2], average="macro", zero_division=0),
                       "kappa_quadratic": cohen_kappa_score(yt, yp, weights="quadratic"),
-                      "false_alarm_rate": float((yp[alert] == 2).mean()) if alert.any() else np.nan})
+                      "false_alarm_rate": float((yp[alert] == 2).mean()) if alert.any() else np.nan})   # Alert -> High
 
 
 def main():
@@ -238,6 +251,7 @@ def main():
           .apply(lambda g: f1_score(g.y_true, g.y_pred, average="macro", labels=[0, 1, 2], zero_division=0))
           .rename("F1").reset_index())
     ps.to_csv(f"{a.out}/temporal_per_subject.csv", index=False)
+    # το k με το καλύτερο F1 στο "all"
     best = piv.loc[[f"late_meta_temporal_k{k}" for k in ctx], "all"].idxmax()
     rows = []
     for scen in ["all", "no_bio", "no_veh", "no_face", "random60"]:
