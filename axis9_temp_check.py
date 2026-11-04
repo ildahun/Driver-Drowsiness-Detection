@@ -29,19 +29,21 @@ from sklearn.impute import SimpleImputer
 from sklearn.metrics import f1_score
 from sklearn.pipeline import Pipeline
 
-import ul_dd_baseline as ul
-import axis3_personalization as a3
+import ul_dd_baseline as ul            # (δεν χρησιμοποιείται κάπου εδώ, μόνο import)
+import axis3_personalization as a3     # load, κανονικοποίηση, μάσκα παραθύρων αναφοράς
 
 warnings.filterwarnings("ignore")
 
 
 def holm(p):
+    # διόρθωση Holm για πολλές συγκρίσεις: ταξινομώ τα p, το μικρότερο x m, το επόμενο x (m-1) κ.λπ.
+    # maximum.accumulate ώστε τα διορθωμένα να μη μικραίνουν, max 1
     p = np.asarray(p, float)
     out = np.full_like(p, np.nan)
     ok = ~np.isnan(p)
     idx = np.argsort(p[ok]); pv = p[ok][idx]; m = len(pv)
     adj = np.maximum.accumulate((m - np.arange(m)) * pv).clip(max=1.0)
-    tmp = np.empty(m); tmp[idx] = adj
+    tmp = np.empty(m); tmp[idx] = adj   # πίσω στην αρχική σειρά
     out[ok] = tmp
     return out
 
@@ -53,12 +55,14 @@ def residual_on_time(x, t, units):
     for u in np.unique(units):
         m = (units == u) & ~np.isnan(x)
         if m.sum() >= 3:
-            b, a = np.polyfit(t[m], x[m], 1)
+            b, a = np.polyfit(t[m], x[m], 1)   # ευθεία: κλίση b, σταθερά a
             r[m] = x[m] - (a + b * t[m])
     return r
 
 
 def model(trees, seed):
+    # ίδιο RF με τους κλάδους του ul_dd_baseline
+    # keep_empty_features: αν μια στήλη είναι όλη NaN στο train, να μη χαθεί (αλλιώς αλλάζει το πλήθος στηλών)
     return Pipeline([("imp", SimpleImputer(strategy="median", keep_empty_features=True)),
                      ("rf", RandomForestClassifier(n_estimators=trees, max_depth=8, min_samples_leaf=5,
                                                    class_weight="balanced", n_jobs=-1, random_state=seed))])
@@ -76,26 +80,29 @@ def main():
 
     df = a3.load(a.features)
     bio = [c for c in df.columns if c.startswith("bio__")]
-    temp = [c for c in bio if c.startswith("bio__TEMP__")]
+    temp = [c for c in bio if c.startswith("bio__TEMP__")]   # mean, std, min, max, slope της θερμοκρασίας
     if not temp:
         print("Δεν βρέθηκαν στήλες bio__TEMP__* στο features.csv."); return
+    # κανονικοποίηση ως προς τα πρώτα 4 λεπτά του ξεκούραστου session (όπως στα axis7/8)
     Xb = a3.baseline_normalize(df[bio].to_numpy(float), df, 4, "sessionA")
-    ti = [bio.index(c) for c in temp]
+    ti = [bio.index(c) for c in temp]                                  # θέσεις των στηλών TEMP στο Xb
     t = df.t_s.to_numpy(float) / 60.0                                  # λεπτά από την αρχή της οδήγησης
     y = df.y.to_numpy(int)
     groups = df.subject.astype(str).to_numpy()
-    units = (df.subject.astype(str) + "_" + df.session.astype(str)).to_numpy()
+    units = (df.subject.astype(str) + "_" + df.session.astype(str)).to_numpy()   # οδήγηση = οδηγός + session, π.χ. A_D
     tmean = Xb[:, bio.index("bio__TEMP__mean")] if "bio__TEMP__mean" in bio else np.nanmean(Xb[:, ti], 1)
-    tres = residual_on_time(tmean, t, units)
+    tres = residual_on_time(tmean, t, units)    # θερμοκρασία χωρίς την τάση του χρόνου
     print(f"{len(df)} παράθυρα, {df.subject.nunique()} οδηγοί, {len(np.unique(units))} οδηγήσεις · "
           f"στήλες θερμοκρασίας: {', '.join(c.replace('bio__', '') for c in temp)}")
 
     # 1. συσχετίσεις μέσα σε κάθε οδήγηση
+    # (μέσα στην οδήγηση, ώστε να μη μετράει ότι κάποιος έχει απλά πιο ζεστά χέρια από άλλον)
     rows = []
     for u in np.unique(units):
         m = units == u
         def rho(a_, b_):
             k = m & ~np.isnan(a_) & ~np.isnan(b_)
+            # λίγα σημεία ή σταθερή τιμή (π.χ. ίδιο KSS όλη την ώρα) -> δεν ορίζεται
             if k.sum() < 8 or np.nanstd(a_[k]) == 0 or np.nanstd(b_[k]) == 0:
                 return np.nan
             return spearmanr(a_[k], b_[k]).correlation
@@ -111,9 +118,10 @@ def main():
         print(f"  {nm:<38} διάμεσος {v.median():+.2f} · μέσος {v.mean():+.2f} · θετική σε {(v > 0).sum()}/{len(v)}")
 
     # 2. LOSO
-    cal = a3.calib_mask(df, 4)
+    cal = a3.calib_mask(df, 4)   # τα παράθυρα αναφοράς (πρώτα 4 λεπτά) δεν μπαίνουν στο test
+    # κάθε σετ χαρακτηριστικών εκπαιδεύεται ξεχωριστά, ίδιοι οδηγοί / ίδια folds
     feats = {
-        "μόνο χρόνος": t[:, None],
+        "μόνο χρόνος": t[:, None],                       # [:, None] -> πίνακας με 1 στήλη
         "μόνο θερμοκρασία": Xb[:, ti],
         "μόνο θερμοκρασία (μέση τιμή)": tmean[:, None],
         "μόνο θερμοκρασία χωρίς χρόνο": tres[:, None],
@@ -134,22 +142,23 @@ def main():
         print(f"  LOSO: νέος οδηγός {s}", flush=True)
     res = pd.DataFrame(rec)
     res.to_csv(f"{a.out}/temp_loso_per_subject.csv", index=False, encoding="utf-8-sig")
-    piv = res.pivot_table(index="subject", columns="model", values="F1")
+    piv = res.pivot_table(index="subject", columns="model", values="F1")   # γραμμές οδηγοί, στήλες σετ
     print("\n=== Νέος οδηγός (LOSO) · macro F1 ανά οδηγό, μέσος όρος ± SD ===")
     for name in feats:
         print(f"  {name:<34} {piv[name].mean():.3f} ± {piv[name].std():.3f}")
 
-    comp = [("βιομετρικά όλα", "βιομετρικά χωρίς θερμοκρασία"),
-            ("μόνο θερμοκρασία", "μόνο χρόνος"),
-            ("μόνο θερμοκρασία (μέση τιμή)", "μόνο θερμοκρασία χωρίς χρόνο")]
+    # οι 3 συγκρίσεις που με ενδιαφέρουν
+    comp = [("βιομετρικά όλα", "βιομετρικά χωρίς θερμοκρασία"),          # χρειάζεται η TEMP;
+            ("μόνο θερμοκρασία", "μόνο χρόνος"),                          # δίνει κάτι παραπάνω από τον χρόνο;
+            ("μόνο θερμοκρασία (μέση τιμή)", "μόνο θερμοκρασία χωρίς χρόνο")]   # τι μένει χωρίς τον χρόνο;
     st = []
     for a_, b_ in comp:
-        d = (piv[a_] - piv[b_]).dropna()
+        d = (piv[a_] - piv[b_]).dropna()   # διαφορά ανά οδηγό
         p = wilcoxon(d).pvalue if (d != 0).any() and len(d) >= 5 else np.nan
         st.append(dict(σύγκριση=f"{a_} έναντι {b_}", νίκες=int((d > 0).sum()), ήττες=int((d < 0).sum()),
                        μέση_διαφορά=round(100 * d.mean(), 1), p=p))
     st = pd.DataFrame(st)
-    st["H"] = holm(st.p.to_numpy())
+    st["H"] = holm(st.p.to_numpy())   # 3 έλεγχοι -> διόρθωση
     st["σημαντικό"] = np.where(st.H < 0.05, "*", "")
     st.to_csv(f"{a.out}/temp_stats.csv", index=False, encoding="utf-8-sig")
     show = st.assign(p=st.p.map(lambda v: f"{v:.3f}"), H=st.H.map(lambda v: f"{v:.3f}"))
