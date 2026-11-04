@@ -44,12 +44,13 @@ import ul_dd_baseline as ul
 import axis3_personalization as a3
 import axis7_ablation as a7
 from axis4_temporal import segments
+# ξαναχρησιμοποιώ τα ίδια κομμάτια με το axis7, ώστε ο κριτής να είναι ακριβώς ο ίδιος
 from axis7_ablation import build, feats, test_state, holm, FULL, ORDER_M, BAD_Q
 
 warnings.filterwarnings("ignore")
 BR, NC = ul.BRANCHES, ul.N_CLASSES
 NB = len(BR)
-BR_GR = {"bio": "βιομετρικά", "veh": "όχημα", "face": "πρόσωπο"}
+BR_GR = {"bio": "βιομετρικά", "veh": "όχημα", "face": "πρόσωπο"}   # για τις εκτυπώσεις
 CLS = ["χαμηλή", "μέτρια", "υψηλή"]
 MAX_GROUPS = 10                      # 2^10 = 1024 συνδυασμοί· πάνω από αυτό οι μικρότερες ομάδες ενώνονται
 
@@ -69,6 +70,7 @@ def load_axis7(df, abl_dir):
         return None
     groups = df.subject.astype(str).to_numpy()
     cal = a3.calib_mask(df, 4)
+    # ίδια παράθυρα ελέγχου με το axis7 (χωρίς τα 4 λεπτά αναφοράς)
     te = {s: np.where((groups == s) & ~cal)[0] for s in sorted(np.unique(groups))}
     yv = df.y.to_numpy(int)
     out = []
@@ -77,10 +79,12 @@ def load_axis7(df, abl_dir):
         r = r[r.scenario == "all"]
         for (sd, m, s), g in r.groupby(["seed", "method", "subject"], sort=False):
             ix = te.get(s)
+            # έλεγχος: ίδιο πλήθος γραμμών και ίδιες ετικέτες, αλλιώς το features.csv δεν είναι το ίδιο
             if ix is None or len(ix) != len(g) or not (yv[ix] == g.y_true.to_numpy()).all():
                 print(f"  [!] {os.path.basename(f)}: οι προβλέψεις του οδηγού {s} δεν ταιριάζουν με το features.csv "
                       "(άλλο features.csv από αυτό του axis7;). Παραλείπεται το μέρος Α.")
                 return None
+            # i = ποιο παράθυρο του df είναι κάθε γραμμή
             out.append(pd.DataFrame({"seed": sd, "method": m, "subject": s, "i": ix,
                                      "y_true": g.y_true.to_numpy(), "y_pred": g.y_pred.to_numpy()}))
     return pd.concat(out, ignore_index=True)
@@ -95,12 +99,14 @@ def realbad_analysis(df, avail, Qall, abl_dir, out):
         return
     miss = np.stack([~avail[b] for b in BR], 1)                     # (n, 3) ο αισθητήρας λείπει εντελώς
     lowq = (Qall < BAD_Q) & ~miss                                   # υπάρχει, αλλά με ποιότητα < 0,9
+    # αν λείπει κάτι -> "λείπει" (έχει προτεραιότητα), αλλιώς αν κάτι είναι χαμηλό -> "χαμηλή_ποιότητα"
     kind = np.where(miss.any(1), "λείπει", np.where(lowq.any(1), "χαμηλή_ποιότητα", "καλό"))
     res["kind"] = kind[res.i]
     seeds = sorted(res.seed.unique())
     meth = [m for m in ORDER_M if m in set(res.method)]
 
     # 1. πόσα παράθυρα
+    # (ένας σπόρος, μία μέθοδος αρκούν, τα παράθυρα είναι ίδια παντού)
     one = res[(res.seed == seeds[0]) & (res.method == FULL)]
     ii = one.i.to_numpy()
     cnt = pd.DataFrame({
@@ -117,6 +123,7 @@ def realbad_analysis(df, avail, Qall, abl_dir, out):
 
     # 2. F1 ανά είδος, μέσος όρος σπόρων
     def table(sel_fn, labels):
+        # για κάθε κατηγορία: F1 ανά σπόρο/μέθοδο, μετά μέσος ± SD των σπόρων
         rows = []
         for lab in labels:
             sub = res[sel_fn(lab)]
@@ -141,7 +148,7 @@ def realbad_analysis(df, avail, Qall, abl_dir, out):
     labs, selb = [], {}
     for b in range(NB):
         for nm, M in (("λείπει", miss), ("χαμηλή", lowq)):
-            lab = f"{nm}:{BR[b]}"
+            lab = f"{nm}:{BR[b]}"                                        # π.χ. "λείπει:face"
             if M[ii, b].sum() >= 30:                                     # τουλάχιστον 30 παράθυρα
                 labs.append(lab); selb[lab] = M[res.i.to_numpy(), b]
     if labs:
@@ -162,6 +169,7 @@ def realbad_analysis(df, avail, Qall, abl_dir, out):
             continue
         ps = (sub.groupby(["seed", "method", "subject"]).apply(lambda g: pd.Series(
             dict(F1=f1m(g.y_true, g.y_pred), n=len(g)))).reset_index())
+        # οδηγοί με < 5 τέτοια παράθυρα βγαίνουν (το F1 τους είναι πολύ ασταθές)
         ps = ps[ps.n >= 5].groupby(["method", "subject"]).F1.mean().unstack(0)
         for other in ("Krishna_ίδια_εκπ", "-ανωμαλία"):
             if other not in ps or FULL not in ps:
@@ -185,6 +193,8 @@ def realbad_analysis(df, avail, Qall, abl_dir, out):
         print(show.to_string(index=False))
 
     # 5. η υπόθεση
+    # αν η ανωμαλία χαλάει κυρίως εκεί που το σήμα λείπει, τότε η διαφορά "-ανωμαλία − FULL"
+    # θα είναι μεγαλύτερη στο "λείπει" απ' ό,τι στη "χαμηλή_ποιότητα"
     mn = t1.pivot_table(index="method", columns="cat", values="mean")
     if "-ανωμαλία" in mn.index and FULL in mn.index:
         print("\n=== Έλεγχος της υπόθεσης · (χωρίς ανωμαλία) − FULL σε μονάδες F1 × 100 "
@@ -205,43 +215,51 @@ def shapley_groups(f, X, bg, groups, chunk=300_000):
     παίρνουν τις τιμές του παραθύρου και οι υπόλοιπες τις τιμές του δείγματος αναφοράς.
     Οι συνδυασμοί υπολογίζονται μαζί, σε λίγες μεγάλες κλήσεις του μοντέλου (γρηγορότερο).
     Επιστρέφει phi (n, G, C), base (C,) και fx (n, C)."""
+    # Κάθε συνδυασμός S είναι ένας ακέραιος 0 .. 2^G − 1: το bit g = 1 σημαίνει ότι η ομάδα g είναι "μέσα".
+    # π.χ. G = 3, S = 5 = 101 -> οι ομάδες 0 και 2 παίρνουν τις πραγματικές τιμές, η 1 του background.
     n, F = X.shape
     m, G = len(bg), len(groups)
-    per = n * m
-    v = np.empty((1 << G, n, NC))
+    per = n * m                                  # γραμμές ανά συνδυασμό (κάθε παράθυρο × κάθε background)
+    v = np.empty((1 << G, n, NC))                # v[S] = μέση πρόβλεψη για τον συνδυασμό S
     batch, Zs = [], []
 
     def flush():
+        # μία κλήση του μοντέλου για πολλούς συνδυασμούς μαζί
         P = f(np.vstack(Zs))
         for k, S in enumerate(batch):
-            v[S] = P[k * per:(k + 1) * per].reshape(n, m, -1).mean(1)
+            v[S] = P[k * per:(k + 1) * per].reshape(n, m, -1).mean(1)   # μέσος όρος πάνω στο background
         batch.clear(); Zs.clear()
 
     for S in range(1 << G):
         Z = np.repeat(bg[None], n, 0)                                   # (n, m, F)
-        cols = [groups[g] for g in range(G) if S >> g & 1]
+        cols = [groups[g] for g in range(G) if S >> g & 1]              # στήλες των ομάδων που είναι στο S
         if cols:
             c = np.concatenate(cols)
-            Z[:, :, c] = X[:, None, c]
+            Z[:, :, c] = X[:, None, c]                                  # αυτές παίρνουν τις τιμές του παραθύρου
         batch.append(S); Zs.append(Z.reshape(per, F))
-        if len(batch) * per >= chunk:
+        if len(batch) * per >= chunk:                                   # όριο μνήμης
             flush()
     if batch:
         flush()
     C = NC
     phi = np.zeros((n, G, C))
+    # τύπος Shapley: φ_g = Σ_S w(|S|) · [v(S ∪ {g}) − v(S)], για όλα τα S που δεν περιέχουν το g
+    # w = |S|! (G − |S| − 1)! / G!
     for g in range(G):
         for S in range(1 << G):
             if S >> g & 1:
                 continue
-            k = bin(S).count("1")
+            k = bin(S).count("1")                                       # |S|
             w = factorial(k) * factorial(G - k - 1) / factorial(G)
             phi[:, g] += w * (v[S | (1 << g)] - v[S])
+    # base = v(κενό), fx = v(όλες οι ομάδες) = κανονική πρόβλεψη
     return phi, v[0].mean(0), v[(1 << G) - 1]
 
 
 def meta_names():
     """Ονόματα και ομάδες των εισόδων του κριτή, με τη σειρά του axis7.feats (όλα τα κομμάτια)."""
+    # για κάθε στήλη: όνομα, σε ποιον κλάδο ανήκει, τι είδος είναι
+    # ΠΡΟΣΟΧΗ: η σειρά πρέπει να είναι ίδια με το feats() (ελέγχεται με assert πιο κάτω)
     names, br, typ = [], [], []
     def add(nm, b, t):
         names.append(nm); br.append(b); typ.append(t)
@@ -268,8 +286,9 @@ TYPES = ["πιθανότητες", "διαθεσιμότητα", "ποιότητ
 
 def signal_of(col):
     """bio__HR__mean -> HR · veh__speed[m/s]__std -> speed · face__FAU_eye_closed -> FAU μάτια."""
-    rest = col.split("__", 1)[1]
-    tok = rest.split("__")[0].split("[")[0]
+    rest = col.split("__", 1)[1]                 # βγάζω το "bio__"
+    tok = rest.split("__")[0].split("[")[0]      # βγάζω το "__mean" και τις μονάδες "[m/s]"
+    # τα FAU είναι πολλά, τα μαζεύω σε ομάδες ανά περιοχή του προσώπου
     if tok.startswith("FAU_"):
         low = tok.lower()
         if any(k in low for k in ("jaw_drop", "mouth_stretch", "lips_part", "yawn")):
@@ -285,8 +304,9 @@ def signal_of(col):
 
 
 def signal_groups(cols):
+    # ομαδοποίηση στηλών ενός κλάδου ανά σήμα
     lab = [signal_of(c) for c in cols]
-    names = list(dict.fromkeys(lab))
+    names = list(dict.fromkeys(lab))             # μοναδικά, με τη σειρά που εμφανίζονται
     groups = {nm: np.array([i for i, l in enumerate(lab) if l == nm]) for nm in names}
     while len(groups) > MAX_GROUPS:                                     # ενώνονται οι δύο μικρότερες ομάδες
         a, b = sorted(groups, key=lambda k: len(groups[k]))[:2]
@@ -296,6 +316,7 @@ def signal_groups(cols):
 
 def importance(phi):
     """Σημαντικότητα ανά ομάδα: μέσο |φ| στις 3 κλάσεις και στα παράθυρα · και μόνο για την κλάση «υψηλή»."""
+    # απόλυτη τιμή: μετράει πόσο επηρεάζει, όχι προς ποια κατεύθυνση
     return np.abs(phi).mean(axis=(0, 2)), np.abs(phi[:, :, 2]).mean(0)
 
 
@@ -313,13 +334,14 @@ def run_shap(df, X, avail, Qall, feat, seed, trees, n_explain, n_bg, noise_sd, o
     srng = np.random.default_rng(seed + 7)
     masks = {"all": np.zeros((n, NB), bool), "random60": srng.random((n, NB)) < 0.6}   # όπως στο axis7
     mnames, mbr, mtyp = meta_names()
+    # δύο τρόποι ομαδοποίησης των εισόδων του κριτή: ανά κλάδο / ανά είδος
     g_mod = [np.where(mbr == b)[0] for b in BR]
     g_typ = [np.where(mtyp == t)[0] for t in TYPES]
     bgroups = {b: signal_groups(feat[b]) for b in BR}
     for b in BR:
         print(f"  ομάδες σημάτων {BR_GR[b]}: " + ", ".join(bgroups[b][0]))
     rec_meta, rec_br, rec_subj = [], [], []
-    add_err = 0.0
+    add_err = 0.0                                # μέγιστο σφάλμα αθροιστικότητας (πρέπει να είναι ~0)
     subjects = sorted(np.unique(groups))
     for si, s in enumerate(subjects, 1):
         t0 = time.time()
@@ -328,17 +350,19 @@ def run_shap(df, X, avail, Qall, feat, seed, trees, n_explain, n_bg, noise_sd, o
         te = np.where((groups == s) & ~cal)[0]
         if len(te) == 0:
             continue
+        # ίδια εκπαίδευση με το FULL του axis7
         B = build(X, avail, sd, y, groups, tr, sub, n, trees, rng, df, seg, order, Qall)
         copies = B["real"] + B["noisec"]
         Xm = np.vstack([feats(*c, tr, seg, order) for c in copies])
         assert Xm.shape[1] == len(mnames), f"{Xm.shape[1]} είσοδοι κριτή αντί για {len(mnames)}"
         meta = ul.fit_meta(Xm, np.concatenate([y[tr]] * len(copies)))
-        bg = Xm[erng.choice(len(Xm), min(n_bg, len(Xm)), replace=False)]
+        bg = Xm[erng.choice(len(Xm), min(n_bg, len(Xm)), replace=False)]   # background από το train
 
         # Β1. κριτής
         for sc in ("all", "random60"):
-            trng = np.random.default_rng(seed + 1000 + a7.SCEN.index(sc))
+            trng = np.random.default_rng(seed + 1000 + a7.SCEN.index(sc))   # ίδιο σενάριο με το axis7
             _, st = test_state(B, X, sd, avail, sub, n, sc, masks[sc], trng, seg, order, None, noise_sd)
+            # εξηγώ μόνο n_explain παράθυρα ανά οδηγό (αλλιώς αργεί πολύ)
             rows = te if len(te) <= n_explain else np.sort(erng.choice(te, n_explain, replace=False))
             Xe = feats(*st, rows, seg, order)
             for scheme, grp, labels in (("αισθητήρας", g_mod, [BR_GR[b] for b in BR]), ("είδος", g_typ, TYPES)):
@@ -352,7 +376,7 @@ def run_shap(df, X, avail, Qall, feat, seed, trees, n_explain, n_bg, noise_sd, o
         # Β2. μέσα σε κάθε κλάδο
         for b in BR:
             mdl = B["models"].get(b)
-            ok_te = te[avail[b][te]]
+            ok_te = te[avail[b][te]]             # μόνο παράθυρα όπου ο κλάδος υπάρχει
             ok_tr = tr[avail[b][tr]]
             if mdl is None or len(ok_te) == 0:
                 continue
@@ -369,11 +393,13 @@ def run_shap(df, X, avail, Qall, feat, seed, trees, n_explain, n_bg, noise_sd, o
     meta_df, br_df = pd.DataFrame(rec_meta), pd.DataFrame(rec_br)
     meta_df.to_csv(f"{out}/shap_meta_per_subject.csv", index=False, encoding="utf-8-sig")
     br_df.to_csv(f"{out}/shap_branch_per_subject.csv", index=False, encoding="utf-8-sig")
+    # αν βγει ~0, ο υπολογισμός Shapley είναι σωστός
     print(f"\n  Έλεγχος αθροιστικότητας (Σ φ + βάση = πρόβλεψη): μέγιστο σφάλμα {add_err:.1e} "
           f"{'· σωστό' if add_err < 1e-6 else '· ΠΡΟΣΟΧΗ'}")
 
     # --- πίνακες
     def share(d, keys, col="imp"):
+        # μέσος όρος στους οδηγούς, μετά % ώστε οι ομάδες να αθροίζουν 100
         g = d.groupby(keys)[col].mean().reset_index()
         tot = g.groupby(keys[:-1])[col].transform("sum")
         g["share"] = 100 * g[col] / tot
@@ -394,6 +420,7 @@ def run_shap(df, X, avail, Qall, feat, seed, trees, n_explain, n_bg, noise_sd, o
               "«υψηλή» = μόνο για την κλάση υψηλής κόπωσης ===")
         print(t.to_string())
 
+    # ανά οδηγό: ποιος αισθητήρας κυριαρχεί στον καθένα
     ps = meta_df[(meta_df.scheme == "αισθητήρας") & (meta_df.scenario == "all")]
     pt = ps.pivot_table(index="subject", columns="group", values="imp")[[BR_GR[b] for b in BR]]
     pt = (100 * pt.div(pt.sum(1), axis=0)).round(0)
@@ -427,6 +454,7 @@ def plots(sm, sb, out):
         return
     col = {"all": "#14213D", "random60": "#B4531A"}
     lab = {"all": "όλοι οι αισθητήρες", "random60": "60% τυχαία κενά"}
+    # γράφημα 1: κριτής, αριστερά ανά αισθητήρα, δεξιά ανά είδος (μπάρες δίπλα-δίπλα για τα 2 σενάρια)
     fig, ax = plt.subplots(1, 2, figsize=(14, 5), gridspec_kw=dict(width_ratios=[1, 2]))
     for k, (scheme, labels) in enumerate((("αισθητήρας", [BR_GR[b] for b in BR]), ("είδος", TYPES))):
         d = sm[sm.scheme == scheme]
@@ -442,6 +470,7 @@ def plots(sm, sb, out):
     ax[0].legend(frameon=False)
     fig.tight_layout(); fig.savefig(f"{out}/shap_kritis.png", dpi=150); plt.close(fig)
 
+    # γράφημα 2: ένα panel ανά κλάδο, σήματα ταξινομημένα
     br = [b for b in BR if b in set(sb.branch)]
     if br:
         fig, ax = plt.subplots(1, len(br), figsize=(5 * len(br), 4.5))
@@ -472,6 +501,7 @@ def main():
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     pd.set_option("display.width", 260)
+    # ίδια προετοιμασία με το axis7
     df = a3.load(a.features)
     feat = {b: [c for c in df.columns if c.startswith(f"{b}__")] for b in BR}
     X = {b: a3.baseline_normalize(df[feat[b]].to_numpy(float), df, 4, "sessionA") for b in BR}
